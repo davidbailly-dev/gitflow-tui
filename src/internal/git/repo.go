@@ -5,7 +5,12 @@ package git
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"io/fs"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -30,10 +35,19 @@ type Repository interface {
 	MergeBase(a, b string) (string, error)
 	CommitDate(ref string) (string, error)
 	IsAncestor(ancestor, descendant string) (bool, error)
+
+	// StateFingerprint renvoie une empreinte bon marché de l'état des refs
+	// (HEAD, branches, refs empaquetées), obtenue par simple lecture de
+	// fichiers plutôt qu'en lançant git. Un changement de valeur signale un
+	// commit, une fusion, un changement de branche, ou une branche créée ou
+	// supprimée — utilisée pour détecter un changement à intervalle
+	// rapproché sans le coût d'un appel git.
+	StateFingerprint() string
 }
 
 type execRepository struct {
-	dir string
+	dir    string // racine du dépôt (working tree)
+	gitDir string // répertoire .git réel, résolu une fois (cf. worktrees)
 }
 
 // Open détecte le dépôt git contenant dir (racine du dépôt) et renvoie un
@@ -46,6 +60,16 @@ func Open(dir string) (Repository, error) {
 		return nil, ErrNotARepo
 	}
 	repo.dir = top
+
+	gitDir, err := repo.run("rev-parse", "--git-dir")
+	if err != nil {
+		return nil, ErrNotARepo
+	}
+	if !filepath.IsAbs(gitDir) {
+		gitDir = filepath.Join(repo.dir, gitDir)
+	}
+	repo.gitDir = gitDir
+
 	return repo, nil
 }
 
@@ -86,6 +110,47 @@ func (r *execRepository) IsAncestor(ancestor, descendant string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w", ancestor, descendant, err)
+}
+
+// StateFingerprint lit HEAD, packed-refs et l'arborescence refs/heads
+// directement sur disque (aucun processus git lancé) et en combine une
+// empreinte : n'importe quel commit, fusion, changement de branche, ou
+// création/suppression de branche modifie l'un de ces fichiers et fait donc
+// varier la valeur renvoyée.
+func (r *execRepository) StateFingerprint() string {
+	h := fnv.New64a()
+
+	if head, err := os.ReadFile(filepath.Join(r.gitDir, "HEAD")); err == nil {
+		h.Write(head)
+	}
+
+	if info, err := os.Stat(filepath.Join(r.gitDir, "packed-refs")); err == nil {
+		fmt.Fprintf(h, "packed-refs:%d:%d", info.Size(), info.ModTime().UnixNano())
+	}
+
+	refsHeads := filepath.Join(r.gitDir, "refs", "heads")
+	var entries []string
+	_ = filepath.WalkDir(refsHeads, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(refsHeads, path)
+		if err != nil {
+			rel = path
+		}
+		entries = append(entries, fmt.Sprintf("%s:%d:%d", rel, info.Size(), info.ModTime().UnixNano()))
+		return nil
+	})
+	sort.Strings(entries)
+	for _, e := range entries {
+		h.Write([]byte(e))
+	}
+
+	return fmt.Sprintf("%x", h.Sum64())
 }
 
 func atoiSafe(s string) int {
