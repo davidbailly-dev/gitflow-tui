@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -10,7 +11,19 @@ import (
 	"gitflow-tui/internal/tui"
 )
 
+// version est la version courante de gitflow-tui, affichée par --version.
+const version = "1.0.0"
+
 func main() {
+	showVersion := flag.Bool("version", false, "affiche la version et quitte")
+	flag.BoolVar(showVersion, "v", false, "affiche la version et quitte (raccourci)")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("gitflow-tui version", version)
+		return
+	}
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "gitflow-tui: impossible de déterminer le répertoire courant:", err)
