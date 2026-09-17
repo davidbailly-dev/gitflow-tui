@@ -95,10 +95,16 @@ type Model struct {
 
 	view      view
 	graphMode graphMode
-	columns   []column
-	paneFocus pane
-	branchIdx int
-	commitIdx int
+	// historyAlertsOnly restreint la vue graphe en mode historique aux
+	// seules lignes signalant une déviation du workflow GitFlow standard.
+	// Actif par défaut : l'historique complet est bruyant sur un dépôt
+	// mature, alors que ce qui mérite l'attention est justement ce qui en
+	// dévie.
+	historyAlertsOnly bool
+	columns           []column
+	paneFocus         pane
+	branchIdx         int
+	commitIdx         int
 
 	filter    string
 	filtering bool
@@ -117,11 +123,12 @@ type Model struct {
 // New construit le modèle initial pour le dépôt donné.
 func New(repo git.Repository) Model {
 	return Model{
-		repo:    repo,
-		view:    viewColumns,
-		graph:   viewport.New(0, 0),
-		diff:    viewport.New(0, 0),
-		loading: true,
+		repo:              repo,
+		view:              viewColumns,
+		graph:             viewport.New(0, 0),
+		diff:              viewport.New(0, 0),
+		loading:           true,
+		historyAlertsOnly: true,
 	}
 }
 
@@ -217,9 +224,13 @@ func loadData(repo git.Repository) tea.Cmd {
 func (m Model) currentGraphContent() string {
 	tl := m.timeline
 	emptyMsg := "Aucune branche feature/release/hotfix, active ou fusionnée."
-	if m.graphMode == graphLive {
+	switch {
+	case m.graphMode == graphLive:
 		tl = filterLive(tl)
 		emptyMsg = "Aucune branche en attente de fusion pour le moment."
+	case m.historyAlertsOnly:
+		tl = filterAlerts(tl)
+		emptyMsg = "Historique propre : aucune déviation du workflow GitFlow détectée."
 	}
 	return renderTimeline(tl, emptyMsg)
 }
@@ -409,6 +420,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.graphMode = graphHistory
 			}
+			m.graph.SetContent(m.currentGraphContent())
+		}
+		return m, nil
+	case key.Matches(msg, keys.Alerts):
+		if m.view == viewGraph && m.graphMode == graphHistory {
+			m.historyAlertsOnly = !m.historyAlertsOnly
 			m.graph.SetContent(m.currentGraphContent())
 		}
 		return m, nil

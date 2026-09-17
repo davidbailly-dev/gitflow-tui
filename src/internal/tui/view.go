@@ -66,10 +66,14 @@ func (m Model) renderHeader() string {
 	viewName := "Colonnes"
 	style := styleHeader
 	if m.view == viewGraph {
-		viewName = "Graphe — historique"
-		if m.graphMode == graphLive {
+		switch {
+		case m.graphMode == graphLive:
 			viewName = "Graphe — direct"
 			style = styleHeaderLive
+		case m.historyAlertsOnly:
+			viewName = "Graphe — historique (alertes)"
+		default:
+			viewName = "Graphe — historique (complet)"
 		}
 	}
 	title := fmt.Sprintf("gitflow-tui — vue: %s", viewName)
@@ -83,6 +87,9 @@ func (m Model) renderFooter() string {
 	help := "tab: vue  ↑↓←→/hjkl: naviguer  /: filtrer  r: rafraîchir  ?: aide  q: quitter"
 	if m.view == viewGraph {
 		help = "tab: vue  m: historique/direct  ↑↓: défiler  r: rafraîchir  ?: aide  q: quitter"
+		if m.graphMode == graphHistory {
+			help = "tab: vue  m: historique/direct  a: alertes/complet  ↑↓: défiler  r: rafraîchir  ?: aide  q: quitter"
+		}
 	}
 	if m.filter != "" {
 		help = "filtre actif: " + m.filter + "  |  " + help
@@ -96,6 +103,7 @@ func (m Model) renderHelp() string {
 		"",
 		"tab            changer de vue (colonnes / graphe)",
 		"m              basculer historique / direct (vue graphe)",
+		"a              basculer alertes seulement / historique complet (vue historique)",
 		"←/→, h/l       changer de panneau (branches / commits / contenu)",
 		"↑/↓, j/k       se déplacer dans le panneau actif (ou défiler le contenu)",
 		"/              filtrer les branches par nom (vue colonnes)",

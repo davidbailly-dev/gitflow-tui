@@ -425,6 +425,34 @@ func filterLive(tl timeline) timeline {
 	return out
 }
 
+// laneHasAlert indique si une ligne signale une déviation du workflow
+// GitFlow standard : fusion hors flow attendu pour ce type de branche,
+// branche apparemment partie de la mauvaise ligne principale,
+// synchronisation directe develop → main, ou fusion partielle (certaines
+// cibles atteintes, d'autres non).
+func laneHasAlert(l timelineLane) bool {
+	if len(l.anomalies) > 0 || l.wrongParent != "" || l.kind == laneSync {
+		return true
+	}
+	return len(l.merged) > 0 && len(l.pending) > 0
+}
+
+// filterAlerts réduit un diagramme complet aux seules lignes qui signalent
+// une déviation du workflow GitFlow standard, pour se concentrer sur ce qui
+// mérite attention plutôt que sur l'historique conforme. Les commits
+// directs sur main/develop sont conservés tels quels : par nature, ils
+// constituent déjà une alerte.
+func filterAlerts(tl timeline) timeline {
+	out := tl
+	out.lanes = nil
+	for _, l := range tl.lanes {
+		if laneHasAlert(l) {
+			out.lanes = append(out.lanes, l)
+		}
+	}
+	return out
+}
+
 func renderTimeline(tl timeline, emptyMsg string) string {
 	if tl.main == nil && tl.develop == nil {
 		return "Aucune branche main/develop trouvée."
@@ -472,7 +500,7 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 	writeGroup("main", colorMain, tl.main, tl.mainDirect, mainLanes)
 	writeGroup("develop", colorDevelop, tl.develop, tl.developDirect, developLanes)
 
-	if len(tl.lanes) == 0 {
+	if len(tl.lanes) == 0 && len(tl.mainDirect) == 0 && len(tl.developDirect) == 0 {
 		b.WriteString(styleFaint.Render(emptyMsg))
 		b.WriteString("\n")
 	}
