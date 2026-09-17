@@ -1,5 +1,7 @@
 # gitflow-tui
 
+![Screenshot001](assets/screenshot-001.png)
+
 Un TUI (interface en mode texte) pour visualiser la structure GitFlow d'un dépôt Git : quelles branches existent, ce qui a été fusionné où, et les écarts par rapport au workflow attendu.
 
 **Lecture seule** : l'outil n'effectue aucune action d'écriture sur le dépôt.

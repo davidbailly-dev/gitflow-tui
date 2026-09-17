@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -17,6 +18,20 @@ import (
 	"gitflow-tui/internal/git"
 	"gitflow-tui/internal/gitflow"
 )
+
+// pollInterval est la fréquence de vérification d'un changement dans le
+// dépôt (nouveau commit, fusion, branche créée/supprimée) pour le
+// rafraîchissement automatique. Chaque tick ne fait que comparer une
+// empreinte bon marché (lecture de fichiers, sans lancer git) ; le
+// rechargement complet n'est déclenché que si elle a changé.
+const pollInterval = 2 * time.Second
+
+// pollTickMsg déclenche une vérification de l'empreinte du dépôt.
+type pollTickMsg struct{}
+
+func pollTick() tea.Cmd {
+	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return pollTickMsg{} })
+}
 
 type view int
 
@@ -72,10 +87,16 @@ type branchRow struct {
 	it     item
 }
 
+// dataLoadedMsg porte le résultat d'un chargement (initial, manuel via 'r',
+// ou automatique en arrière-plan). fingerprint est l'empreinte du dépôt
+// telle qu'elle était juste avant les lectures git : la comparer à
+// l'empreinte courante lors du tick suivant permet de rattraper tout
+// changement survenu pendant le chargement lui-même.
 type dataLoadedMsg struct {
-	columns  []column
-	timeline timeline
-	err      error
+	columns     []column
+	timeline    timeline
+	fingerprint string
+	err         error
 }
 
 // diffLoadedMsg porte le contenu (git show) du commit demandé. hash permet
@@ -95,10 +116,22 @@ type Model struct {
 
 	view      view
 	graphMode graphMode
-	columns   []column
-	paneFocus pane
-	branchIdx int
-	commitIdx int
+	// historyAlertsOnly restreint la vue graphe en mode historique aux
+	// seules lignes signalant une déviation du workflow GitFlow standard.
+	// Actif par défaut : l'historique complet est bruyant sur un dépôt
+	// mature, alors que ce qui mérite l'attention est justement ce qui en
+	// dévie.
+	historyAlertsOnly bool
+	columns           []column
+	paneFocus         pane
+	branchIdx         int
+	commitIdx         int
+	// selectedBranchName et selectedCommitHash retiennent la sélection
+	// actuelle par identité plutôt que par index, pour la retrouver après un
+	// rechargement des données même si l'ajout ou la suppression d'une
+	// branche ou d'un commit a décalé les positions.
+	selectedBranchName string
+	selectedCommitHash string
 
 	filter    string
 	filtering bool
@@ -111,29 +144,39 @@ type Model struct {
 
 	showHelp bool
 	loading  bool
-	err      error
+	// refreshing indique qu'un chargement (manuel ou automatique) est déjà
+	// en cours, pour éviter de superposer deux appels git concurrents.
+	refreshing bool
+	// lastFingerprint est l'empreinte du dépôt correspondant aux données
+	// actuellement affichées ; comparée à chaque tick pour détecter un
+	// changement à rafraîchir automatiquement.
+	lastFingerprint string
+	err             error
 }
 
 // New construit le modèle initial pour le dépôt donné.
 func New(repo git.Repository) Model {
 	return Model{
-		repo:    repo,
-		view:    viewColumns,
-		graph:   viewport.New(0, 0),
-		diff:    viewport.New(0, 0),
-		loading: true,
+		repo:              repo,
+		view:              viewColumns,
+		graph:             viewport.New(0, 0),
+		diff:              viewport.New(0, 0),
+		loading:           true,
+		historyAlertsOnly: true,
 	}
 }
 
 func (m Model) Init() tea.Cmd {
-	return loadData(m.repo)
+	return tea.Batch(loadData(m.repo), pollTick())
 }
 
 func loadData(repo git.Repository) tea.Cmd {
 	return func() tea.Msg {
+		fingerprint := repo.StateFingerprint()
+
 		branches, err := repo.Branches()
 		if err != nil {
-			return dataLoadedMsg{err: err}
+			return dataLoadedMsg{fingerprint: fingerprint, err: err}
 		}
 
 		names := make([]string, len(branches))
@@ -208,7 +251,7 @@ func loadData(repo git.Repository) tea.Cmd {
 
 		tl := buildTimeline(repo, nodes, byName)
 
-		return dataLoadedMsg{columns: cols, timeline: tl}
+		return dataLoadedMsg{columns: cols, timeline: tl, fingerprint: fingerprint}
 	}
 }
 
@@ -217,9 +260,13 @@ func loadData(repo git.Repository) tea.Cmd {
 func (m Model) currentGraphContent() string {
 	tl := m.timeline
 	emptyMsg := "Aucune branche feature/release/hotfix, active ou fusionnée."
-	if m.graphMode == graphLive {
+	switch {
+	case m.graphMode == graphLive:
 		tl = filterLive(tl)
 		emptyMsg = "Aucune branche en attente de fusion pour le moment."
+	case m.historyAlertsOnly:
+		tl = filterAlerts(tl)
+		emptyMsg = "Historique propre : aucune déviation du workflow GitFlow détectée."
 	}
 	return renderTimeline(tl, emptyMsg)
 }
@@ -334,15 +381,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case dataLoadedMsg:
 		m.loading = false
+		m.refreshing = false
 		m.err = msg.err
 		if msg.err != nil {
 			return m, nil
 		}
+		m.lastFingerprint = msg.fingerprint
 		m.columns = msg.columns
 		m.timeline = msg.timeline
 		m.graph.SetContent(m.currentGraphContent())
-		m.ensureBranchSelection()
+		m.restoreBranchSelection()
+		m.restoreCommitSelection()
 		return m, m.syncDiff()
+
+	case pollTickMsg:
+		next := pollTick()
+		if m.loading || m.refreshing {
+			return m, next
+		}
+		if m.repo.StateFingerprint() == m.lastFingerprint {
+			return m, next
+		}
+		m.refreshing = true
+		return m, tea.Batch(next, loadData(m.repo))
 
 	case diffLoadedMsg:
 		if msg.hash != m.diffFor {
@@ -394,6 +455,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case key.Matches(msg, keys.Refresh):
 		m.loading = true
+		m.refreshing = true
 		return m, loadData(m.repo)
 	case key.Matches(msg, keys.Tab):
 		if m.view == viewColumns {
@@ -409,6 +471,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.graphMode = graphHistory
 			}
+			m.graph.SetContent(m.currentGraphContent())
+		}
+		return m, nil
+	case key.Matches(msg, keys.Alerts):
+		if m.view == viewGraph && m.graphMode == graphHistory {
+			m.historyAlertsOnly = !m.historyAlertsOnly
 			m.graph.SetContent(m.currentGraphContent())
 		}
 		return m, nil
@@ -467,6 +535,7 @@ func (m *Model) moveSelection(d int) tea.Cmd {
 	case paneBranches:
 		m.moveBranch(d)
 		m.commitIdx = 0
+		m.syncSelectedCommitHash()
 	case paneCommits:
 		m.moveCommit(d)
 	}
@@ -484,6 +553,7 @@ func (m *Model) moveBranch(d int) {
 		i = ((i+d)%n + n) % n
 		if selectableRow(rows, i) {
 			m.branchIdx = i
+			m.syncSelectedBranchName()
 			return
 		}
 	}
@@ -499,6 +569,7 @@ func (m *Model) moveCommit(d int) {
 		return
 	}
 	m.commitIdx = ((m.commitIdx+d)%n + n) % n
+	m.syncSelectedCommitHash()
 }
 
 // syncDiff s'assure que le panneau "contenu" correspond au commit
@@ -526,19 +597,85 @@ func selectableRow(rows []branchRow, i int) bool {
 
 // ensureBranchSelection fait sauter la sélection vers la première branche
 // visible si la ligne active n'en est plus une, typiquement après une
-// modification du filtre ou un rafraîchissement des données.
+// modification du filtre. Tient à jour selectedBranchName au passage.
 func (m *Model) ensureBranchSelection() {
 	rows := m.flatBranches()
 	if selectableRow(rows, m.branchIdx) {
+		m.syncSelectedBranchName()
 		return
 	}
 	for i := range rows {
 		if selectableRow(rows, i) {
 			m.branchIdx = i
+			m.syncSelectedBranchName()
 			return
 		}
 	}
 	m.branchIdx = 0
+	m.selectedBranchName = ""
+}
+
+// restoreBranchSelection retrouve, après un rechargement des données, la
+// ligne correspondant à la branche qui était sélectionnée avant coup — par
+// son nom, pas son index, puisqu'une branche ajoutée ou supprimée décale
+// les positions sans changer les noms des autres. Si cette branche n'existe
+// plus (supprimée entre-temps), retombe sur la première branche visible.
+func (m *Model) restoreBranchSelection() {
+	rows := m.flatBranches()
+	if m.selectedBranchName != "" {
+		for i, row := range rows {
+			if selectableRow(rows, i) && row.it.node.Name == m.selectedBranchName {
+				m.branchIdx = i
+				return
+			}
+		}
+	}
+	m.ensureBranchSelection()
+}
+
+// syncSelectedBranchName met à jour le nom de la branche sélectionnée
+// d'après l'index courant, pour pouvoir la retrouver après un futur
+// rechargement des données.
+func (m *Model) syncSelectedBranchName() {
+	rows := m.flatBranches()
+	if selectableRow(rows, m.branchIdx) {
+		m.selectedBranchName = rows[m.branchIdx].it.node.Name
+	}
+}
+
+// restoreCommitSelection retrouve, après un rechargement des données, le
+// commit qui était sélectionné avant coup — par son hash — pour que le
+// panneau de contenu ne change pas silencieusement de commit à cause d'un
+// nouveau commit apparu en tête de liste. Si ce commit n'existe plus dans
+// la liste rechargée, retombe sur le premier commit.
+func (m *Model) restoreCommitSelection() {
+	it, ok := m.selectedBranchRow()
+	if !ok {
+		m.commitIdx = 0
+		m.selectedCommitHash = ""
+		return
+	}
+	if m.selectedCommitHash != "" {
+		for i, c := range it.commits {
+			if c.Hash == m.selectedCommitHash {
+				m.commitIdx = i
+				return
+			}
+		}
+	}
+	m.commitIdx = 0
+	m.syncSelectedCommitHash()
+}
+
+// syncSelectedCommitHash met à jour le hash du commit sélectionné d'après
+// l'index courant, pour pouvoir le retrouver après un futur rechargement
+// des données.
+func (m *Model) syncSelectedCommitHash() {
+	if c, ok := m.selectedCommit(); ok {
+		m.selectedCommitHash = c.Hash
+	} else {
+		m.selectedCommitHash = ""
+	}
 }
 
 func (m Model) visibleItems(col column) []item {

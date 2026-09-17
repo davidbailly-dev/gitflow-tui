@@ -9,6 +9,7 @@ type keyMap struct {
 	Right   key.Binding
 	Tab     key.Binding
 	Mode    key.Binding
+	Alerts  key.Binding
 	Refresh key.Binding
 	Filter  key.Binding
 	Help    key.Binding
@@ -22,6 +23,7 @@ var keys = keyMap{
 	Right:   key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "colonne suiv.")),
 	Tab:     key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "changer de vue")),
 	Mode:    key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "historique/direct")),
+	Alerts:  key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "alertes/historique complet")),
 	Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rafraîchir")),
 	Filter:  key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filtrer")),
 	Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "aide")),
