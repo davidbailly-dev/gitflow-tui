@@ -528,6 +528,11 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 	}
 
 	var b strings.Builder
+	if axis := renderAxis(tl.lanes); axis != "" {
+		b.WriteString(axis)
+		b.WriteString("\n")
+	}
+
 	writeGroup := func(color lipgloss.Color, spine *timelineLane, direct []git.Commit, group []timelineLane) {
 		if spine == nil {
 			return
@@ -558,6 +563,47 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 	}
 
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// renderAxis dessine l'axe du temps, au-dessus des lignes permanentes :
+// l'année dans la marge (celle de la première date), puis la date (MM-JJ)
+// de chaque jour sous la première colonne de ce jour, alignée sur son
+// repère "┬" — ou la date complète quand l'année change. Une date qui
+// chevaucherait la précédente est omise plutôt que décalée sous une autre
+// colonne, où elle serait trompeuse. lanes doit être trié par colonne.
+func renderAxis(lanes []timelineLane) string {
+	var b strings.Builder
+	end := 0 // première position libre après le dernier texte écrit
+	prevDay, year := "", ""
+	for _, l := range lanes {
+		if len(l.date) < 10 || l.date[:10] == prevDay {
+			continue
+		}
+		day := l.date[:10]
+		prevDay = day
+		if year == "" {
+			year = day[:4]
+			gutter := fmt.Sprintf("  %-*s", laneLabelWidth-2, year)
+			b.WriteString(gutter)
+			end = len(gutter)
+		}
+		label := day[5:]
+		if day[:4] != year {
+			label = day
+		}
+		x := laneX(l)
+		if x < end || (x == end && end > laneLabelWidth) {
+			continue
+		}
+		b.WriteString(strings.Repeat(" ", x-end))
+		b.WriteString(label)
+		end = x + len(label)
+		year = day[:4]
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	return styleFaint.Render(b.String())
 }
 
 // renderDirectCommits affiche, à la suite des lignes de branches d'une ligne

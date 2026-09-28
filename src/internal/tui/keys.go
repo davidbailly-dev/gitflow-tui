@@ -30,12 +30,12 @@ var keys = keyMap{
 	Right:   key.NewBinding(key.WithKeys("right", "l"), key.WithHelp("→/l", "panneau suivant")),
 	Tab:     key.NewBinding(key.WithKeys("tab"), key.WithHelp("tab", "changer de vue")),
 	Mode:    key.NewBinding(key.WithKeys("m"), key.WithHelp("m", "historique/direct")),
-	Alerts:  key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "alertes/complet")),
+	Alerts:  key.NewBinding(key.WithKeys("a"), key.WithHelp("a", "écarts/complet")),
 	Refresh: key.NewBinding(key.WithKeys("r"), key.WithHelp("r", "rafraîchir")),
 	Filter:  key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filtrer")),
 	Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "aide")),
 	Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quitter")),
 
 	Navigate: key.NewBinding(key.WithHelp("↑↓←→/hjkl", "naviguer")),
-	Scroll:   key.NewBinding(key.WithHelp("↑↓", "défiler")),
+	Scroll:   key.NewBinding(key.WithHelp("↑↓←→", "défiler")),
 }

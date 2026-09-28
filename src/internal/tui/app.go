@@ -4,7 +4,6 @@
 package tui
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -12,7 +11,6 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
 	"gitflow-tui/internal/git"
@@ -25,6 +23,10 @@ import (
 // empreinte bon marché (lecture de fichiers, sans lancer git) ; le
 // rechargement complet n'est déclenché que si elle a changé.
 const pollInterval = 2 * time.Second
+
+// graphScrollStep est le pas du défilement horizontal de la vue graphe
+// (←/→), en caractères : quatre colonnes du diagramme.
+const graphScrollStep = 4 * cellWidth
 
 // pollTickMsg déclenche une vérification de l'empreinte du dépôt.
 type pollTickMsg struct{}
@@ -63,6 +65,16 @@ const (
 	graphLive
 )
 
+// mergeStatus résume où en est l'intégration d'une branche éphémère dans
+// ses cibles GitFlow, tel que le calcule le graphe.
+type mergeStatus int
+
+const (
+	statusPending mergeStatus = iota // aucune cible atteinte (ou branche permanente)
+	statusMerged                     // toutes les cibles atteintes
+	statusPartial                    // certaines cibles atteintes, pas toutes
+)
+
 // item est une branche prête à être affichée : sa classification GitFlow,
 // ses données git, et son statut par rapport à sa branche parente.
 type item struct {
@@ -70,6 +82,7 @@ type item struct {
 	branch  git.Branch
 	ahead   int
 	behind  int
+	status  mergeStatus
 	commits []git.Commit
 }
 
@@ -79,11 +92,11 @@ type column struct {
 }
 
 // branchRow est une ligne du panneau de gauche de la vue colonnes : soit un
-// en-tête de groupe (non sélectionnable), soit un indicateur "(vide)" pour
-// un groupe sans branche, soit une branche.
+// en-tête de groupe (non sélectionnable, avec le nombre de branches
+// affichées), soit une branche.
 type branchRow struct {
 	header string
-	empty  bool
+	count  int
 	it     item
 }
 
@@ -93,19 +106,21 @@ type branchRow struct {
 // l'empreinte courante lors du tick suivant permet de rattraper tout
 // changement survenu pendant le chargement lui-même.
 type dataLoadedMsg struct {
-	columns     []column
-	timeline    timeline
-	fingerprint string
-	err         error
+	columns       []column
+	timeline      timeline
+	currentBranch string
+	fingerprint   string
+	err           error
 }
 
-// diffLoadedMsg porte le contenu (git show) du commit demandé. hash permet
-// d'ignorer un résultat devenu obsolète si la sélection a changé entre
-// temps.
+// diffLoadedMsg porte le contenu (git show) du commit demandé et, pour une
+// fusion, les commits qu'elle a apportés. hash permet d'ignorer un résultat
+// devenu obsolète si la sélection a changé entre temps.
 type diffLoadedMsg struct {
-	hash    string
-	content string
-	err     error
+	hash   string
+	merged []git.Commit
+	show   string
+	err    error
 }
 
 // Model est le modèle racine Bubble Tea de gitflow-tui.
@@ -138,9 +153,21 @@ type Model struct {
 
 	timeline timeline
 	graph    viewport.Model
+	// graphX est le décalage horizontal (en colonnes de caractères) de la
+	// vue graphe, dont les lignes dépassent souvent la largeur du terminal.
+	graphX int
 
 	diff    viewport.Model
 	diffFor string
+	// diffMerged et diffShow gardent le contenu brut du commit affiché, pour
+	// le remettre en forme (retour à la ligne) quand la largeur change.
+	diffMerged []git.Commit
+	diffShow   string
+
+	// currentBranch et loadedAt alimentent l'en-tête : branche courante
+	// (vide si HEAD est détachée) et heure du dernier chargement réussi.
+	currentBranch string
+	loadedAt      time.Time
 
 	showHelp bool
 	loading  bool
@@ -257,8 +284,7 @@ func loadData(repo git.Repository) tea.Cmd {
 		}
 
 		cols := []column{
-			{title: "main", items: build(mains)},
-			{title: "develop", items: build(develops)},
+			{title: "permanentes", items: append(build(mains), build(develops)...)},
 			{title: "feature/*", items: build(features)},
 			{title: "release/*", items: build(releases)},
 			{title: "hotfix/*", items: build(hotfixes)},
@@ -267,7 +293,31 @@ func loadData(repo git.Repository) tea.Cmd {
 
 		tl := buildTimeline(repo, classifier, nodes, byName, sp, commitsByName)
 
-		return dataLoadedMsg{columns: cols, timeline: tl, fingerprint: fingerprint}
+		// Le statut de fusion affiché dans la vue colonnes est celui calculé
+		// pour le graphe, pour que les deux vues ne se contredisent pas.
+		statuses := make(map[string]mergeStatus, len(tl.lanes))
+		for _, l := range tl.lanes {
+			if l.kind != laneLive || len(l.merged) == 0 {
+				continue
+			}
+			if len(l.pending) == 0 {
+				statuses[l.node.Name] = statusMerged
+			} else {
+				statuses[l.node.Name] = statusPartial
+			}
+		}
+		var current string
+		for ci := range cols {
+			for ii := range cols[ci].items {
+				it := &cols[ci].items[ii]
+				it.status = statuses[it.node.Name]
+				if it.branch.IsHead {
+					current = it.node.Name
+				}
+			}
+		}
+
+		return dataLoadedMsg{columns: cols, timeline: tl, currentBranch: current, fingerprint: fingerprint}
 	}
 }
 
@@ -288,49 +338,62 @@ func (m Model) currentGraphContent() string {
 }
 
 // loadDiff récupère en tâche de fond le contenu complet (git show) du commit
-// c. Si c'est une fusion, la liste des commits qu'elle a apportés (souvent
-// invisibles dans l'historique premier-parent de main/develop) est ajoutée
-// avant le diff, puisque celui-ci est en pratique peu informatif pour une
-// fusion propre (git montre alors un diff combiné, généralement vide).
+// c. Si c'est une fusion, les commits qu'elle a apportés (souvent
+// invisibles dans l'historique premier-parent de main/develop) sont
+// récupérés aussi, pour être affichés avant le diff, puisque celui-ci est en
+// pratique peu informatif pour une fusion propre (git montre alors un diff
+// combiné, généralement vide).
 func loadDiff(repo git.Repository, c git.Commit, width int) tea.Cmd {
 	return func() tea.Msg {
-		var b strings.Builder
+		var merged []git.Commit
 		if c.IsMerge {
-			if commits, err := repo.MergeCommits(c.Hash); err == nil && len(commits) > 0 {
-				b.WriteString(renderMergedCommits(commits, width))
-				b.WriteString("\n")
+			if commits, err := repo.MergeCommits(c.Hash); err == nil {
+				merged = commits
 			}
 		}
-		content, err := repo.Show(c.Hash)
+		show, err := repo.Show(c.Hash, width)
 		if err != nil {
 			return diffLoadedMsg{hash: c.Hash, err: err}
 		}
-		b.WriteString(content)
-		return diffLoadedMsg{hash: c.Hash, content: b.String()}
+		return diffLoadedMsg{hash: c.Hash, merged: merged, show: show}
 	}
 }
 
-// renderMergedCommits liste les commits apportés par une fusion. Chaque
-// ligne est tronquée à width plutôt que laissée au retour à la ligne
-// automatique du viewport : ce dernier ne réapplique pas toujours la
-// couleur sur la partie repliée, qui apparaît alors en blanc.
-func renderMergedCommits(commits []git.Commit, width int) string {
-	if width < 1 {
-		width = 1
+// refreshDiff remet en forme le contenu du commit affiché pour la largeur
+// actuelle du panneau, sans changer la position de défilement.
+func (m *Model) refreshDiff() {
+	if m.diffShow == "" {
+		return
 	}
-	headerStyle := lipgloss.NewStyle().Foreground(colorWarning)
-	commitStyle := lipgloss.NewStyle().Foreground(colorFeature)
+	m.diff.SetContent(renderDiff(m.diffMerged, m.diffShow, m.diff.Width))
+}
 
-	// Format volontairement court (pas de date) pour limiter le retour à la
-	// ligne dans le panneau, plus étroit qu'un terminal plein écran.
-	var b strings.Builder
-	header := ansi.Truncate(fmt.Sprintf("⑂ %d commit(s) fusionné(s) :", len(commits)), width, "…")
-	fmt.Fprintf(&b, "%s\n", headerStyle.Render(header))
-	for _, mc := range commits {
-		line := ansi.Truncate(fmt.Sprintf("· %s %s", mc.Hash, mc.Subject), width, "…")
-		fmt.Fprintf(&b, "%s\n", commitStyle.Render(line))
+// graphLegend résume les symboles du graphe, en tête de la vue.
+var graphLegend = styleFaint.Render("● courante  ○ en cours  ✔ fusionnée  × supprimée  ⚠ écart GitFlow  —  ? : légende complète")
+
+// refreshGraph recalcule la vue graphe et la découpe horizontalement selon
+// graphX : chaque ligne est tronquée à la largeur du terminal (avec "…")
+// plutôt que renvoyée à la ligne par le viewport, ce qui casserait
+// l'alignement du diagramme. Au-delà de la marge de gauche, figée (noms des
+// lignes permanentes, année), le diagramme défile de graphX colonnes.
+func (m *Model) refreshGraph() {
+	lines := strings.Split(m.currentGraphContent(), "\n")
+	widest := 0
+	for _, l := range lines {
+		widest = maxInt(widest, ansi.StringWidth(l))
 	}
-	return b.String()
+	width := maxInt(m.graph.Width, 1)
+	m.graphX = maxInt(0, minInt(m.graphX, widest-width))
+	for i, l := range lines {
+		if m.graphX > 0 {
+			margin := ansi.Truncate(l, laneLabelWidth, "")
+			margin += strings.Repeat(" ", laneLabelWidth-ansi.StringWidth(margin))
+			l = margin + cutLeft(l, laneLabelWidth+m.graphX)
+		}
+		lines[i] = ansi.Truncate(l, width, "…")
+	}
+	legend := ansi.Truncate(graphLegend, width, "…")
+	m.graph.SetContent(legend + "\n\n" + strings.Join(lines, "\n"))
 }
 
 // paneContentHeight renvoie la hauteur de contenu disponible pour chacun
@@ -393,6 +456,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		_, _, diffWidth := m.paneWidths()
 		m.diff.Width = diffWidth - 2
 		m.diff.Height = m.paneContentHeight() - 1
+		m.refreshDiff()
+		m.refreshGraph()
 		return m, nil
 
 	case dataLoadedMsg:
@@ -405,7 +470,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lastFingerprint = msg.fingerprint
 		m.columns = msg.columns
 		m.timeline = msg.timeline
-		m.graph.SetContent(m.currentGraphContent())
+		m.currentBranch = msg.currentBranch
+		m.loadedAt = time.Now()
+		m.refreshGraph()
 		m.restoreBranchSelection()
 		m.restoreCommitSelection()
 		return m, m.syncDiff()
@@ -428,7 +495,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.diff.SetContent(styleFaint.Render("Erreur : " + msg.err.Error()))
 		} else {
-			m.diff.SetContent(msg.content)
+			m.diffMerged, m.diffShow = msg.merged, msg.show
+			m.refreshDiff()
 		}
 		// SetContent ne réinitialise pas le défilement : sans ça, la
 		// position laissée par un diff précédent (parfois déjà tout en bas)
@@ -494,13 +562,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.graphMode = graphHistory
 			}
-			m.graph.SetContent(m.currentGraphContent())
+			m.refreshGraph()
 		}
 		return m, nil
 	case key.Matches(msg, keys.Alerts):
 		if m.view == viewGraph && m.graphMode == graphHistory {
 			m.historyAlertsOnly = !m.historyAlertsOnly
-			m.graph.SetContent(m.currentGraphContent())
+			m.refreshGraph()
 		}
 		return m, nil
 	case key.Matches(msg, keys.Filter):
@@ -511,6 +579,16 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.view == viewGraph {
+		switch {
+		case key.Matches(msg, keys.Left):
+			m.graphX -= graphScrollStep
+			m.refreshGraph()
+			return m, nil
+		case key.Matches(msg, keys.Right):
+			m.graphX += graphScrollStep
+			m.refreshGraph()
+			return m, nil
+		}
 		var cmd tea.Cmd
 		m.graph, cmd = m.graph.Update(msg)
 		return m, cmd
@@ -601,6 +679,7 @@ func (m *Model) syncDiff() tea.Cmd {
 	c, ok := m.selectedCommit()
 	if !ok {
 		m.diffFor = ""
+		m.diffMerged, m.diffShow = nil, ""
 		m.diff.SetContent(styleFaint.Render("Aucun commit sélectionné."))
 		m.diff.GotoTop()
 		return nil
@@ -609,13 +688,14 @@ func (m *Model) syncDiff() tea.Cmd {
 		return nil
 	}
 	m.diffFor = c.Hash
+	m.diffMerged, m.diffShow = nil, ""
 	m.diff.SetContent(styleFaint.Render("Chargement..."))
 	m.diff.GotoTop()
 	return loadDiff(m.repo, c, m.diff.Width)
 }
 
 func selectableRow(rows []branchRow, i int) bool {
-	return i >= 0 && i < len(rows) && rows[i].header == "" && !rows[i].empty
+	return i >= 0 && i < len(rows) && rows[i].header == ""
 }
 
 // ensureBranchSelection fait sauter la sélection vers la première branche
@@ -728,16 +808,16 @@ func (m Model) visibleItems(col column) []item {
 
 // flatBranches aplatit les colonnes groupées par type GitFlow en une liste
 // unique de lignes pour le panneau de gauche de la vue colonnes : un en-tête
-// par groupe, un indicateur "(vide)" si le groupe filtré n'a plus de
-// résultat, puis ses branches.
+// par groupe (avec son nombre de branches), puis ses branches. Les groupes
+// sans branche — ou sans résultat pour le filtre en cours — sont omis.
 func (m Model) flatBranches() []branchRow {
 	var rows []branchRow
 	for _, col := range m.columns {
-		rows = append(rows, branchRow{header: col.title})
 		items := m.visibleItems(col)
 		if len(items) == 0 {
-			rows = append(rows, branchRow{empty: true})
+			continue
 		}
+		rows = append(rows, branchRow{header: col.title, count: len(items)})
 		for _, it := range items {
 			rows = append(rows, branchRow{it: it})
 		}

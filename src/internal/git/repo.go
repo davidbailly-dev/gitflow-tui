@@ -23,6 +23,8 @@ var ErrNotARepo = errors.New("not a git repository")
 // L'interface permet de substituer une implémentation de test dans les
 // paquets qui en dépendent.
 type Repository interface {
+	// Root renvoie la racine du working tree.
+	Root() string
 	CurrentBranch() (string, error)
 	Branches() ([]Branch, error)
 	AheadBehind(base, branch string) (ahead, behind int, err error)
@@ -33,7 +35,7 @@ type Repository interface {
 	DirectCommits(ref string) ([]Commit, error)
 	FirstParentHashes(ref string) ([]string, error)
 	FirstParentCommits(ref string) ([]Commit, error)
-	Show(hash string) (string, error)
+	Show(hash string, width int) (string, error)
 	CommitDate(ref string) (string, error)
 	IsAncestor(ancestor, descendant string) (bool, error)
 
@@ -97,6 +99,10 @@ func (r *execRepository) run(args ...string) (string, error) {
 		return "", fmt.Errorf("git %s: %w", strings.Join(args, " "), err)
 	}
 	return strings.TrimRight(string(out), "\n"), nil
+}
+
+func (r *execRepository) Root() string {
+	return r.dir
 }
 
 func (r *execRepository) CurrentBranch() (string, error) {

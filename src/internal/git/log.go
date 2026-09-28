@@ -1,6 +1,9 @@
 package git
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // Commit décrit un commit tel que rapporté par git log.
 type Commit struct {
@@ -122,9 +125,14 @@ func (r *execRepository) FirstParentCommits(ref string) ([]Commit, error) {
 }
 
 // Show renvoie le contenu complet d'un commit : message, auteur, date,
-// statistiques et diff complet.
-func (r *execRepository) Show(hash string) (string, error) {
-	return r.run("show", "--stat", "--patch", hash)
+// statistiques et diff complet. Les statistiques sont calibrées pour tenir
+// dans width colonnes (0 : largeur par défaut de git).
+func (r *execRepository) Show(hash string, width int) (string, error) {
+	stat := "--stat"
+	if width > 0 {
+		stat = fmt.Sprintf("--stat=%d", width)
+	}
+	return r.run("show", stat, "--patch", hash)
 }
 
 // DirectCommits renvoie les commits committés directement sur ref (en

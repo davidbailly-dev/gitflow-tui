@@ -42,13 +42,17 @@ L'affichage se met à jour de lui-même dès que le dépôt change (commit, fusi
 
 Trois panneaux, façon navigateur de fichiers :
 
-1. **Branches** — toutes les branches, groupées par type GitFlow (`main`, `develop`, `feature/*`, `release/*`, `hotfix/*`, `autre`).
-2. **Commits / fusions** — pour `main` et `develop`, leur historique direct ; pour les autres branches, leurs seuls commits propres, y compris une fois la branche fusionnée. Les commits de fusion sont repérés (`⑂`, en orange) ; les autres commits sont en vert.
-3. **Contenu** — le détail complet du commit sélectionné (message, fichiers, diff). Si c'est une fusion, la liste des commits qu'elle a apportés est affichée en premier.
+1. **Branches** — toutes les branches, groupées par type GitFlow (permanentes `main`/`develop`, `feature/*`, `release/*`, `hotfix/*`, `autre`), chaque type dans sa couleur. À côté du nom : `✔` si la branche est fusionnée dans toutes ses cibles, `⚠` si seulement dans certaines, sinon `↑n`/`↓n`, son avance et son retard sur sa branche parente.
+2. **Commits / fusions** — pour `main` et `develop`, leur historique direct ; pour les autres branches, leurs seuls commits propres, y compris une fois la branche fusionnée. Les commits de fusion sont repérés par `⑂` et une couleur à part.
+3. **Contenu** — le détail complet du commit sélectionné (message, fichiers, diff coloré). Si c'est une fusion, la liste des commits qu'elle a apportés est affichée en premier.
+
+La sélection est surlignée franchement dans le panneau actif, et plus discrètement dans les autres.
 
 ### Vue Graphe
 
-Une frise chronologique horizontale : `main` et `develop` sur leurs propres lignes, les branches éphémères (actives ou déjà fusionnées et supprimées) en dessous, chacune reliée par un trait vertical à son repère `┬` sur la ligne principale. Les branches sont placées de gauche à droite par date de première fusion, ou de création si elles ne sont pas encore fusionnées.
+Une frise chronologique horizontale : `main` et `develop` sur leurs propres lignes, les branches éphémères (actives ou déjà fusionnées et supprimées) en dessous, chacune reliée par un trait vertical à son repère `┬` sur la ligne principale. Les branches sont placées de gauche à droite par date de première fusion, ou de création si elles ne sont pas encore fusionnées ; un axe des dates surmonte le diagramme. Si le diagramme dépasse la largeur du terminal, `←` `→` le font défiler horizontalement.
+
+L'orange est réservé aux écarts au workflow GitFlow ; `?` affiche la légende complète des symboles.
 
 Elle a deux modes :
 - **Historique** — ce qui s'est passé, y compris les branches supprimées reconstituées depuis les messages de fusion (git, GitHub, GitLab, Bitbucket), et les écarts détectés par rapport au workflow GitFlow : fusion vers une cible inattendue, release ou hotfix jamais refusionnée dans l'une de ses cibles, commit direct hors fusion, branche partie du mauvais parent, synchronisation directe `develop` → `main`. Par défaut, seuls ces **écarts** sont affichés ; `a` bascule vers l'historique complet.
@@ -63,9 +67,9 @@ Les intégrations de pull request en squash (sujet terminé par `(#12)`) ne sont
 | `Tab` | Basculer entre la vue Colonnes et la vue Graphe |
 | `m` | Basculer Historique / Direct (vue Graphe) |
 | `a` | Basculer écarts seulement / historique complet (vue Graphe, mode Historique) |
-| `↑` `↓` / `j` `k` | Se déplacer dans le panneau actif (ou faire défiler le contenu) |
-| `←` `→` / `h` `l` | Changer de panneau (vue Colonnes) |
+| `↑` `↓` / `j` `k` | Se déplacer dans le panneau actif (ou faire défiler le contenu, ou le graphe) |
+| `←` `→` / `h` `l` | Changer de panneau (vue Colonnes) / défiler horizontalement (vue Graphe) |
 | `/` | Filtrer les branches par nom (vue Colonnes) |
 | `r` | Rafraîchir les données |
-| `?` | Afficher/masquer l'aide |
+| `?` | Afficher/masquer l'aide et la légende des symboles |
 | `q` / `Ctrl+C` | Quitter |
