@@ -93,7 +93,7 @@ func (h *fakeHistory) checkoutNew(name string) *fakeHistory {
 // merge fusionne source dans la branche extraite (--no-ff), avec le
 // message subject.
 func (h *fakeHistory) merge(source, subject string) string {
-	hash := h.newCommit(subject, h.branches[h.head], h.resolve(source))
+	hash := h.newCommit(subject, h.branches[h.head], h.mustResolve(source))
 	h.branches[h.head] = hash
 	return hash
 }
@@ -108,21 +108,39 @@ func (h *fakeHistory) tag(name string) {
 	h.tags[tip] = append(h.tags[tip], name)
 }
 
-func (h *fakeHistory) resolve(ref string) string {
+// resolve renvoie le commit désigné par ref (branche ou hash). Une
+// référence inconnue est une erreur du scénario ou de l'analyse : elle est
+// signalée par t.Errorf, utilisable depuis les goroutines de l'analyse
+// (contrairement à t.Fatalf).
+func (h *fakeHistory) resolve(ref string) (string, error) {
 	if tip, ok := h.branches[ref]; ok {
-		return tip
+		return tip, nil
 	}
 	if _, ok := h.commits[ref]; ok {
-		return ref
+		return ref, nil
 	}
-	h.t.Fatalf("référence %q inconnue", ref)
-	return ""
+	h.t.Errorf("référence %q inconnue", ref)
+	return "", fmt.Errorf("référence %q inconnue", ref)
+}
+
+// mustResolve est resolve pour la construction des scénarios (goroutine du
+// test).
+func (h *fakeHistory) mustResolve(ref string) string {
+	hash, err := h.resolve(ref)
+	if err != nil {
+		h.t.FailNow()
+	}
+	return hash
 }
 
 // reachable renvoie les commits atteignables depuis ref.
-func (h *fakeHistory) reachable(ref string) map[string]bool {
+func (h *fakeHistory) reachable(ref string) (map[string]bool, error) {
+	start, err := h.resolve(ref)
+	if err != nil {
+		return nil, err
+	}
 	seen := make(map[string]bool)
-	stack := []string{h.resolve(ref)}
+	stack := []string{start}
 	for len(stack) > 0 {
 		hash := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -132,7 +150,16 @@ func (h *fakeHistory) reachable(ref string) map[string]bool {
 		seen[hash] = true
 		stack = append(stack, h.commits[hash].Parents...)
 	}
-	return seen
+	return seen, nil
+}
+
+// reachable2 renvoie les commits atteignables depuis a et depuis b.
+func (h *fakeHistory) reachable2(a, b string) (ra, rb map[string]bool, err error) {
+	if ra, err = h.reachable(a); err != nil {
+		return nil, nil, err
+	}
+	rb, err = h.reachable(b)
+	return ra, rb, err
 }
 
 // sorted renvoie les commits de set du plus récent au plus ancien, comme
@@ -172,8 +199,12 @@ func (h *fakeHistory) GitflowConfig() (map[string]string, error) { return h.conf
 func (h *fakeHistory) Tags() (map[string][]string, error) { return h.tags, nil }
 
 func (h *fakeHistory) FirstParentLog(ref string) ([]Commit, error) {
+	start, err := h.resolve(ref)
+	if err != nil {
+		return nil, err
+	}
 	var out []Commit
-	for hash := h.resolve(ref); hash != ""; {
+	for hash := start; hash != ""; {
 		c := h.commits[hash]
 		out = append(out, c)
 		hash = ""
@@ -184,24 +215,39 @@ func (h *fakeHistory) FirstParentLog(ref string) ([]Commit, error) {
 	return out, nil
 }
 
-func (h *fakeHistory) MergeLog(ref string) ([]Commit, error) {
-	return h.sorted(h.reachable(ref), Commit.IsMerge), nil
-}
-
 func (h *fakeHistory) CommitsBetween(base, tip string) ([]Commit, error) {
-	return h.sorted(minus(h.reachable(tip), h.reachable(base)), nil), nil
+	rb, rt, err := h.reachable2(base, tip)
+	if err != nil {
+		return nil, err
+	}
+	return h.sorted(minus(rt, rb), nil), nil
 }
 
 func (h *fakeHistory) AheadBehind(base, branch string) (int, int, error) {
-	b, r := h.reachable(base), h.reachable(branch)
+	b, r, err := h.reachable2(base, branch)
+	if err != nil {
+		return 0, 0, err
+	}
 	return len(minus(r, b)), len(minus(b, r)), nil
 }
 
 func (h *fakeHistory) CountNotIn(branch, base string) (int, error) {
+	r, b, err := h.reachable2(branch, base)
+	if err != nil {
+		return 0, err
+	}
 	notMerge := func(c Commit) bool { return !c.IsMerge() }
-	return len(h.sorted(minus(h.reachable(branch), h.reachable(base)), notMerge)), nil
+	return len(h.sorted(minus(r, b), notMerge)), nil
 }
 
 func (h *fakeHistory) IsAncestor(ancestor, descendant string) (bool, error) {
-	return h.reachable(descendant)[h.resolve(ancestor)], nil
+	a, err := h.resolve(ancestor)
+	if err != nil {
+		return false, err
+	}
+	r, err := h.reachable(descendant)
+	if err != nil {
+		return false, err
+	}
+	return r[a], nil
 }

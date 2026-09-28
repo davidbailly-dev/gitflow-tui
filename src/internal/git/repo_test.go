@@ -53,12 +53,12 @@ func TestLogParsing(t *testing.T) {
 	if len(log) != 2 || log[0].Subject != "feat: a | b" || len(log[0].Parents) != 1 || len(log[0].Hash) != 40 {
 		t.Fatalf("ligne directe mal décodée : %+v", log)
 	}
-	merges, err := repo.MergeLog("develop")
+	develop, err := repo.FirstParentLog("develop")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(merges) != 1 || !merges[0].IsMerge() || merges[0].Parents[1] != log[0].Hash {
-		t.Fatalf("fusions mal décodées : %+v", merges)
+	if len(develop) != 2 || !develop[0].IsMerge() || develop[0].Parents[1] != log[0].Hash {
+		t.Fatalf("fusion mal décodée : %+v", develop)
 	}
 }
 
@@ -127,5 +127,87 @@ func TestFingerprintInWorktree(t *testing.T) {
 	gitIn(t, dir, "branch", "feature/y", "develop")
 	if repo.StateFingerprint() == before {
 		t.Fatal("la création d'une branche n'a pas changé l'empreinte du worktree")
+	}
+}
+
+// En mode remote, la branche courante est celle du remote que suit la
+// branche extraite, pas une branche distante homonyme.
+func TestRemoteCurrentBranch(t *testing.T) {
+	origin := newRepo(t)
+	clone := filepath.Join(t.TempDir(), "clone")
+	gitIn(t, filepath.Dir(clone), "clone", "-q", origin, clone)
+
+	current := func() string {
+		t.Helper()
+		repo, err := Open(clone, "origin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		branches, err := repo.Branches()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, b := range branches {
+			if b.IsHead {
+				return b.Name
+			}
+		}
+		return ""
+	}
+
+	gitIn(t, clone, "checkout", "-q", "develop") // suit origin/develop
+	if got := current(); got != "develop" {
+		t.Errorf("branche courante = %q, attendu develop", got)
+	}
+	gitIn(t, clone, "checkout", "-q", "-b", "feature/x", "--no-track") // homonyme, sans suivi
+	if got := current(); got != "" {
+		t.Errorf("branche courante = %q, attendu aucune (feature/x locale ne suit pas origin)", got)
+	}
+}
+
+func TestFingerprintCoversTags(t *testing.T) {
+	dir := newRepo(t)
+	repo, err := Open(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := repo.StateFingerprint()
+	gitIn(t, dir, "tag", "v1.0")
+	if repo.StateFingerprint() == before {
+		t.Fatal("la création d'un tag n'a pas changé l'empreinte")
+	}
+}
+
+// "|" est autorisé dans un nom de ref : il ne doit pas couper les champs.
+func TestRefNamesWithPipe(t *testing.T) {
+	dir := newRepo(t)
+	gitIn(t, dir, "branch", "feature/a|b")
+	gitIn(t, dir, "tag", "v1|rc")
+	repo, err := Open(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	branches, err := repo.Branches()
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, b := range branches {
+		found = found || (b.Name == "feature/a|b" && b.CommitDate != "")
+		if b.Name == "feature/a" {
+			t.Error("branche fantôme feature/a")
+		}
+	}
+	if !found {
+		t.Errorf("feature/a|b absente ou mal décodée : %+v", branches)
+	}
+	tags, err := repo.Tags()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for commit, names := range tags {
+		if len(commit) != 40 {
+			t.Errorf("hash mal décodé %q pour %v", commit, names)
+		}
 	}
 }

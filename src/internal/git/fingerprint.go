@@ -11,13 +11,16 @@ import (
 )
 
 // StateFingerprint lit HEAD, packed-refs et les arborescences de refs
-// directement sur disque (aucun processus git lancé) et en combine une
-// empreinte : n'importe quel commit, fusion, changement de branche, ou
-// création/suppression de branche modifie l'un de ces fichiers et fait donc
-// varier la valeur renvoyée. HEAD est propre au worktree, les refs sont
-// partagées (commonDir) ; le répertoire reftable couvre les dépôts qui
-// utilisent ce format de stockage des refs (git 2.45+) à la place de
-// refs/heads et packed-refs.
+// analysées directement sur disque (aucun processus git lancé) et en
+// combine une empreinte : n'importe quel commit, fusion, changement de
+// branche, création/suppression de branche ou de tag modifie l'un de ces
+// fichiers et fait donc varier la valeur renvoyée. HEAD est propre au
+// worktree, les refs sont partagées (commonDir) ; le répertoire reftable
+// couvre les dépôts qui utilisent ce format de stockage des refs (git
+// 2.45+) à la place des fichiers de refs et de packed-refs.
+//
+// En mode remote, seules les branches du remote sont lues : un commit local
+// ne change rien à l'analyse et ne doit pas déclencher de rechargement.
 func (r *Repository) StateFingerprint() string {
 	h := fnv.New64a()
 
@@ -29,10 +32,12 @@ func (r *Repository) StateFingerprint() string {
 		fmt.Fprintf(h, "packed-refs:%d:%d", info.Size(), info.ModTime().UnixNano())
 	}
 
-	writeTreeFingerprint(h, filepath.Join(r.commonDir, "refs", "heads"))
 	if r.remote != "" {
 		writeTreeFingerprint(h, filepath.Join(r.commonDir, "refs", "remotes", r.remote))
+	} else {
+		writeTreeFingerprint(h, filepath.Join(r.commonDir, "refs", "heads"))
 	}
+	writeTreeFingerprint(h, filepath.Join(r.commonDir, "refs", "tags"))
 	writeTreeFingerprint(h, filepath.Join(r.commonDir, "reftable"))
 
 	return fmt.Sprintf("%x", h.Sum64())

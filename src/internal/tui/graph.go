@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
@@ -84,20 +83,6 @@ func newGraphData(r gitflow.Report, mode graphMode, deviationsOnly bool) graphDa
 	return g
 }
 
-// compactColumns renumérote les colonnes des lignes visibles de 0 à n-1,
-// dans leur ordre chronologique : une fois l'historique filtré (alertes,
-// direct), les colonnes des lignes masquées laisseraient sinon des trous et
-// étireraient le diagramme bien au-delà de ce qui est affiché.
-func compactColumns(lanes []graphLane) []graphLane {
-	out := make([]graphLane, len(lanes))
-	copy(out, lanes)
-	sort.SliceStable(out, func(i, j int) bool { return out[i].col < out[j].col })
-	for i := range out {
-		out[i].col = i
-	}
-	return out
-}
-
 // laneX renvoie la position horizontale (en caractères) du repère d'une
 // ligne, identique sur la ligne permanente ("┬") et sur la ligne de la
 // branche ("└─▶").
@@ -139,7 +124,6 @@ func renderGraph(g graphData, emptyMsg, selectedKey string) (string, []graphAnch
 		return "Aucune branche main/develop trouvée.", nil
 	}
 
-	g.lanes = compactColumns(g.lanes)
 	spineLen := (len(g.lanes)+1)*cellWidth + 2
 	if spineLen < 16 {
 		spineLen = 16
@@ -206,10 +190,17 @@ type graphAnchor struct {
 }
 
 // laneKey identifie une ligne du graphe d'un rendu à l'autre, pour garder
-// la sélection après un rechargement ou un changement de mode (plusieurs
-// synchronisations develop → main portent le même nom, d'où la date).
+// la sélection après un rechargement ou un changement de mode. Le nom d'une
+// branche suffit (il est unique parmi les lignes) et reste valable quand
+// elle change d'état sous les yeux de l'utilisateur : fusionnée, sa date
+// change ; supprimée, elle passe de présente à reconstituée. Les
+// synchronisations develop → main, qui portent toutes le même nom, se
+// distinguent par leur date, qui ne change jamais.
 func laneKey(l graphLane) string {
-	return fmt.Sprintf("%d|%s|%s", l.Kind, l.Node.Name, l.Date)
+	if l.Kind == gitflow.LaneSync {
+		return "sync|" + l.Date
+	}
+	return "branche|" + l.Node.Name
 }
 
 // renderAxis dessine l'axe du temps, au-dessus des lignes permanentes :

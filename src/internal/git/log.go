@@ -46,11 +46,6 @@ func (r *Repository) FirstParentLog(ref string) ([]gitflow.Commit, error) {
 	return r.log("--first-parent", r.ref(ref))
 }
 
-// MergeLog renvoie tous les commits de fusion atteignables depuis ref.
-func (r *Repository) MergeLog(ref string) ([]gitflow.Commit, error) {
-	return r.log("--merges", r.ref(ref))
-}
-
 // CommitsBetween renvoie les commits atteignables depuis tip mais pas depuis
 // base : ce qu'une fusion de parents base et tip a apporté.
 func (r *Repository) CommitsBetween(base, tip string) ([]gitflow.Commit, error) {

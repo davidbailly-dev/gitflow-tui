@@ -158,15 +158,16 @@ func (r *Repository) GitflowConfig() (map[string]string, error) {
 }
 
 // Tags lit tous les tags en une seule commande ; pour un tag annoté,
-// %(*objectname) donne le commit pointé (et %(objectname) l'objet tag).
+// %(*objectname) donne le commit pointé (et %(objectname) l'objet tag). Les
+// champs sont séparés comme dans Branches.
 func (r *Repository) Tags() (map[string][]string, error) {
-	out, err := r.run("for-each-ref", "--format=%(refname:short)|%(objectname)|%(*objectname)", "refs/tags")
+	out, err := r.run("for-each-ref", "--format=%(refname:short)%1f%(objectname)%1f%(*objectname)", "refs/tags")
 	if err != nil {
 		return nil, err
 	}
 	tags := make(map[string][]string)
 	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "|", 3)
+		parts := strings.SplitN(line, "\x1f", 3)
 		if len(parts) != 3 {
 			continue
 		}
