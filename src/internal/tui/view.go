@@ -2,12 +2,13 @@ package tui
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"gitflow-tui/internal/git"
 	"gitflow-tui/internal/gitflow"
 )
 
@@ -23,7 +24,7 @@ func (m Model) View() string {
 	footer := m.renderFooter()
 
 	if m.showHelp {
-		return lipgloss.JoinVertical(lipgloss.Left, header, m.renderHelp(), footer)
+		return m.padToHeight(lipgloss.JoinVertical(lipgloss.Left, header, m.renderHelp(), footer))
 	}
 
 	var body string
@@ -62,6 +63,9 @@ func (m Model) padToHeight(content string) string {
 	return content + "\n" + strings.Join(pad, "\n")
 }
 
+// renderHeader affiche à gauche le dépôt, la branche courante et la vue
+// active, à droite l'état des données : rechargement en cours, ou heure du
+// dernier chargement.
 func (m Model) renderHeader() string {
 	viewName := "Colonnes"
 	style := styleHeader
@@ -71,45 +75,130 @@ func (m Model) renderHeader() string {
 			viewName = "Graphe — direct"
 			style = styleHeaderLive
 		case m.historyAlertsOnly:
-			viewName = "Graphe — historique (alertes)"
+			viewName = "Graphe — historique (écarts)"
 		default:
 			viewName = "Graphe — historique (complet)"
 		}
 	}
-	title := fmt.Sprintf("gitflow-tui — vue: %s", viewName)
-	return style.Width(maxInt(m.width, 0)).Render(title)
+
+	branch := "HEAD détachée"
+	if m.report.CurrentBranch != "" {
+		branch = "● " + m.report.CurrentBranch
+	}
+	repoName := filepath.Base(m.repo.Root())
+	if remote := m.repo.Remote(); remote != "" {
+		repoName += " (branches de " + remote + ")"
+	}
+	left := fmt.Sprintf("gitflow-tui · %s · %s · vue: %s", repoName, branch, viewName)
+
+	right := ""
+	switch {
+	case m.refreshing:
+		right = "⟳ rafraîchissement…"
+	case !m.loadedAt.IsZero():
+		right = "à jour " + m.loadedAt.Format("15:04:05")
+	}
+
+	// La largeur du style comprend son padding horizontal (1 de chaque côté).
+	inner := maxInt(m.width-2, 0)
+	if lipgloss.Width(left)+1+lipgloss.Width(right) > inner {
+		right = ""
+	}
+	left = ansi.Truncate(left, inner, "…")
+	gap := maxInt(inner-lipgloss.Width(left)-lipgloss.Width(right), 0)
+	return style.Width(maxInt(m.width, 0)).Render(left + strings.Repeat(" ", gap) + right)
 }
 
+// renderFooter affiche les raccourcis utiles dans la vue active, ou la
+// saisie du filtre. Le texte est tronqué à la largeur du terminal : replié
+// sur deux lignes, il repousserait l'en-tête hors de l'écran.
 func (m Model) renderFooter() string {
+	inner := maxInt(m.width-2, 0) // padding horizontal du style
 	if m.filtering {
-		return styleFooter.Width(maxInt(m.width, 0)).Render("Filtrer : " + m.filter + "█  (entrée: valider, échap: annuler)")
+		return styleFooter.Width(maxInt(m.width, 0)).Render(ansi.Truncate("Filtrer : "+m.filter+"█  (entrée: valider, échap: annuler)", inner, "…"))
 	}
-	help := "tab: vue  ↑↓←→/hjkl: naviguer  /: filtrer  r: rafraîchir  ?: aide  q: quitter"
+	bindings := []key.Binding{keys.Tab, keys.Navigate, keys.Filter}
 	if m.view == viewGraph {
-		help = "tab: vue  m: historique/direct  ↑↓: défiler  r: rafraîchir  ?: aide  q: quitter"
+		bindings = []key.Binding{keys.Tab, keys.Mode}
 		if m.graphMode == graphHistory {
-			help = "tab: vue  m: historique/direct  a: alertes/complet  ↑↓: défiler  r: rafraîchir  ?: aide  q: quitter"
+			bindings = append(bindings, keys.Alerts)
 		}
+		bindings = append(bindings, keys.Select, keys.Open, keys.Scroll)
 	}
+	bindings = append(bindings, keys.Refresh, keys.Help, keys.Quit)
+
+	help := shortHelp(bindings...)
 	if m.filter != "" {
 		help = "filtre actif: " + m.filter + "  |  " + help
 	}
-	return styleFooter.Width(maxInt(m.width, 0)).Render(help)
+	return styleFooter.Width(maxInt(m.width, 0)).Render(ansi.Truncate(help, inner, "…"))
 }
 
+// shortHelp résume des raccourcis sur une ligne ("tab: changer de vue  …").
+func shortHelp(bindings ...key.Binding) string {
+	parts := make([]string, 0, len(bindings))
+	for _, b := range bindings {
+		h := b.Help()
+		parts = append(parts, h.Key+": "+h.Desc)
+	}
+	return strings.Join(parts, "  ")
+}
+
+// helpSection liste des raccourcis sous un titre, un par ligne.
+func helpSection(title string, bindings ...key.Binding) []string {
+	lines := []string{styleColumnTitle.Render(title)}
+	for _, b := range bindings {
+		h := b.Help()
+		lines = append(lines, fmt.Sprintf("  %-12s %s", h.Key, h.Desc))
+	}
+	return append(lines, "")
+}
+
+// legendSection explique un symbole par ligne, sous un titre.
+func legendSection(title string, entries ...[2]string) []string {
+	lines := []string{styleColumnTitle.Render(title)}
+	for _, e := range entries {
+		lines = append(lines, fmt.Sprintf("  %-12s %s", e[0], e[1]))
+	}
+	return append(lines, "")
+}
+
+// renderHelp affiche les raccourcis à gauche et la légende des symboles à
+// droite, côte à côte pour tenir dans un terminal de hauteur modeste.
 func (m Model) renderHelp() string {
+	var shortcuts []string
+	shortcuts = append(shortcuts, helpSection("Général", keys.Tab, keys.Refresh, keys.Help, keys.Quit)...)
+	shortcuts = append(shortcuts, helpSection("Vue colonnes", keys.Up, keys.Down, keys.Left, keys.Right, keys.Filter)...)
+	shortcuts = append(shortcuts, helpSection("Vue graphe", keys.Mode, keys.Alerts, keys.Select, keys.Open, keys.Scroll)...)
+
+	var symbols []string
+	symbols = append(symbols, legendSection("Branches",
+		[2]string{"●", "branche courante"},
+		[2]string{"↑n", "commits pas encore dans la branche parente"},
+		[2]string{"↓n", "commits de la parente absents de la branche"},
+		[2]string{"✔", "fusionnée dans toutes ses cibles"},
+		[2]string{"⚠", "fusionnée dans une partie de ses cibles"},
+		[2]string{"◷nj", "inactive depuis n jours"},
+		[2]string{"⑂", "commit de fusion"},
+	)...)
+	symbols = append(symbols, legendSection("Graphe",
+		[2]string{"┬ │ └─▶", "départ ou fusion d'une branche"},
+		[2]string{"○", "en cours"},
+		[2]string{"×", "supprimée (reconstituée)"},
+		[2]string{"◆", "tag de version"},
+		[2]string{"⚠", "écart au workflow GitFlow"},
+	)...)
+
+	columns := lipgloss.JoinHorizontal(lipgloss.Top,
+		lipgloss.NewStyle().PaddingRight(6).Render(strings.Join(shortcuts, "\n")),
+		strings.Join(symbols, "\n"),
+	)
 	lines := []string{
 		"Aide — gitflow-tui",
 		"",
-		"tab            changer de vue (colonnes / graphe)",
-		"m              basculer historique / direct (vue graphe)",
-		"a              basculer alertes seulement / historique complet (vue historique)",
-		"←/→, h/l       changer de panneau (branches / commits / contenu)",
-		"↑/↓, j/k       se déplacer dans le panneau actif (ou défiler le contenu)",
-		"/              filtrer les branches par nom (vue colonnes)",
-		"r              rafraîchir les données",
-		"?              afficher/masquer cette aide",
-		"q, ctrl+c      quitter",
+		columns,
+		styleFaint.Render("Le dépôt est surveillé : l'affichage se met à jour de lui-même après un"),
+		styleFaint.Render("commit, une fusion, un changement ou une suppression de branche."),
 		"",
 		"Appuie sur ? pour revenir.",
 	}
@@ -181,23 +270,21 @@ func (m Model) renderBranchPane(width int) string {
 	contentH := m.paneContentHeight()
 	rows := m.flatBranches()
 
+	focused := m.paneFocus == paneBranches
 	lines := make([]string, 0, len(rows))
 	for i, row := range rows {
-		switch {
-		case row.header != "":
-			lines = append(lines, styleColumnTitle.Render(row.header))
-		case row.empty:
-			lines = append(lines, styleFaint.Render("  (vide)"))
-		default:
-			line := renderItemLine(row.it)
-			if i == m.branchIdx {
-				line = styleSelected.Render(line)
-			}
-			lines = append(lines, line)
+		if row.header != "" {
+			lines = append(lines, styleColumnTitle.Render(row.header)+styleFaint.Render(fmt.Sprintf(" %d", row.count)))
+			continue
 		}
+		lines = append(lines, renderItemLine(row.it, i == m.branchIdx, focused))
 	}
 	if len(lines) == 0 {
-		lines = []string{styleFaint.Render("Aucune branche trouvée.")}
+		msg := "Aucune branche trouvée."
+		if m.filter != "" {
+			msg = "Aucune branche ne correspond au filtre."
+		}
+		lines = []string{styleFaint.Render(msg)}
 	}
 	lines = truncateLines(lines, maxInt(width-2, 1))
 
@@ -215,13 +302,13 @@ func (m Model) renderCommitPane(width int) string {
 	switch {
 	case !ok:
 		lines = []string{styleFaint.Render("Aucune branche sélectionnée.")}
-	case len(it.commits) == 0:
-		header = styleColumnTitle.Render(it.node.Name)
+	case len(it.Commits) == 0:
+		header = styleColumnTitle.Render(it.Node.Name)
 		lines = []string{styleFaint.Render("(aucun commit)")}
 	default:
-		header = styleColumnTitle.Render(it.node.Name)
-		for i, c := range it.commits {
-			lines = append(lines, renderCommitLine(c, i == m.commitIdx))
+		header = styleColumnTitle.Render(it.Node.Name)
+		for i, c := range it.Commits {
+			lines = append(lines, renderCommitLine(c, i == m.commitIdx, m.paneFocus == paneCommits))
 		}
 	}
 
@@ -235,35 +322,37 @@ func (m Model) renderCommitPane(width int) string {
 	return box.Width(width).Height(contentH).Render(content)
 }
 
-func renderCommitLine(c git.Commit, selected bool) string {
+// renderCommitLine dessine un commit de la liste : hash et date atténués,
+// sujet en clair, ou en couleur de fusion (avec "⑂") pour un commit de
+// fusion. La ligne sélectionnée est surlignée d'un seul tenant.
+func renderCommitLine(c gitflow.Commit, selected, focused bool) string {
 	marker := " "
-	color := colorFeature
-	if c.IsMerge {
+	subject := lipgloss.NewStyle()
+	if c.IsMerge() {
 		marker = "⑂"
-		color = colorWarning
+		subject = subject.Foreground(colorMerge)
 	}
-	style := lipgloss.NewStyle().Foreground(color)
 	if selected {
-		style = style.Reverse(true)
+		return selectionStyle(subject, focused).Render(fmt.Sprintf("%s %s %s — %s", marker, c.Short(), c.AuthorDate, c.Subject))
 	}
-	return style.Render(fmt.Sprintf("%s %s %s — %s", marker, c.Hash, shortDate(c.Date), c.Subject))
+	meta := styleFaint.Render(fmt.Sprintf("%s %s —", c.Short(), c.AuthorDate))
+	return subject.Render(marker) + " " + meta + " " + subject.Render(c.Subject)
 }
 
-// mentionedBranch cherche une mention de branche feature/release/hotfix
-// dans subject (message d'un commit de fusion) et renvoie son nom classifié
-// GitFlow, pour afficher la branche source d'une fusion plutôt que sa seule
-// cible.
-func mentionedBranch(subject string) (name string, branchType gitflow.BranchType, ok bool) {
-	name = branchMentionRe.FindString(subject)
-	if name == "" {
+// mergedBranch renvoie la branche source d'un commit de fusion, lue dans
+// son message, et son type GitFlow selon les conventions du dépôt, pour
+// afficher la branche intégrée par une fusion plutôt que sa seule cible.
+func (m Model) mergedBranch(subject string) (name string, branchType gitflow.BranchType, ok bool) {
+	merge, ok := gitflow.ParseMerge(subject)
+	if !ok {
 		return "", 0, false
 	}
-	return name, gitflow.Classify([]string{name})[0].Type, true
+	return merge.Source, m.report.Classifier.ClassifyOne(merge.Source).Type, true
 }
 
 // renderDiffPane dessine le panneau "contenu". Son en-tête rappelle la
 // branche concernée, colorée selon son type GitFlow : la branche source
-// d'une fusion (ex. feature/x, mentionnée dans le message) si elle est
+// d'une fusion (ex. feature/x, lue dans le message) si elle est
 // identifiable, sinon celle sélectionnée au panneau 1 — sans quoi on la
 // perd de vue dès que le focus en sort.
 func (m Model) renderDiffPane(width int) string {
@@ -272,20 +361,20 @@ func (m Model) renderDiffPane(width int) string {
 	c, hasCommit := m.selectedCommit()
 
 	var branchLabel string
-	if hasCommit && c.IsMerge {
-		if name, branchType, found := mentionedBranch(c.Subject); found {
+	if hasCommit && c.IsMerge() {
+		if name, branchType, found := m.mergedBranch(c.Subject); found {
 			branchLabel = lipgloss.NewStyle().Bold(true).Foreground(colorFor(branchType)).Render(name)
 		}
 	}
 	if branchLabel == "" {
 		if it, ok := m.selectedBranchRow(); ok {
-			branchLabel = lipgloss.NewStyle().Bold(true).Foreground(colorFor(it.node.Type)).Render(it.node.Name)
+			branchLabel = lipgloss.NewStyle().Bold(true).Foreground(colorFor(it.Node.Type)).Render(it.Node.Name)
 		}
 	}
 
 	title := "Contenu"
 	if hasCommit {
-		title = fmt.Sprintf("%s — %s", c.Hash, c.Subject)
+		title = fmt.Sprintf("%s — %s", c.Short(), c.Subject)
 	}
 
 	sep := ""
@@ -301,21 +390,67 @@ func (m Model) renderDiffPane(width int) string {
 	return box.Width(width).Height(m.paneContentHeight()).Render(content)
 }
 
-func renderItemLine(it item) string {
+// renderItemLine dessine une branche du panneau de gauche, dans la couleur
+// de son type : "✔" si elle est fusionnée dans toutes ses cibles, "⚠" si
+// seulement dans certaines, sinon son avance (↑) et son retard (↓) sur sa
+// branche parente, zéros omis.
+func renderItemLine(it gitflow.BranchState, selected, focused bool) string {
 	marker := " "
-	if it.branch.IsHead {
+	if it.Branch.IsHead {
 		marker = "●"
 	}
-	status := ""
-	if it.ahead > 0 || it.behind > 0 {
-		status = fmt.Sprintf(" ↑%d↓%d", it.ahead, it.behind)
-	}
-
-	style := lipgloss.NewStyle().Foreground(colorFor(it.node.Type))
-	if it.branch.IsHead {
+	style := lipgloss.NewStyle().Foreground(colorFor(it.Node.Type))
+	if it.Branch.IsHead {
 		style = style.Bold(true)
 	}
-	return style.Render(fmt.Sprintf("%s %s%s", marker, it.node.Name, status))
+
+	var status string
+	statusStyle := styleFaint
+	switch it.Status {
+	case gitflow.StatusMerged:
+		status = "✔"
+	case gitflow.StatusPartial:
+		status = "⚠"
+		statusStyle = lipgloss.NewStyle().Foreground(colorWarning)
+	default:
+		var parts []string
+		if it.Ahead > 0 {
+			parts = append(parts, fmt.Sprintf("↑%d", it.Ahead))
+		}
+		if it.Behind > 0 {
+			parts = append(parts, fmt.Sprintf("↓%d", it.Behind))
+		}
+		status = strings.Join(parts, " ")
+	}
+
+	if it.StaleDays > 0 {
+		stale := fmt.Sprintf("◷%dj", it.StaleDays)
+		if status == "" {
+			status = stale
+		} else {
+			status += " " + stale
+		}
+		statusStyle = lipgloss.NewStyle().Foreground(colorWarning)
+	}
+
+	text := marker + " " + it.Node.Name
+	if selected {
+		if status != "" {
+			text += " " + status
+		}
+		return selectionStyle(style, focused).Render(text)
+	}
+	if status == "" {
+		return style.Render(text)
+	}
+	return style.Render(text) + " " + statusStyle.Render(status)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func maxInt(a, b int) int {

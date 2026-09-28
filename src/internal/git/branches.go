@@ -1,47 +1,67 @@
 package git
 
-import "strings"
+import (
+	"strings"
 
-// Branch décrit une branche locale telle que rapportée par git.
-type Branch struct {
-	Name       string
-	Head       string // hash court du dernier commit
-	CommitDate string
-	Upstream   string // branche distante suivie, vide si aucune
-	IsHead     bool
-}
+	"gitflow-tui/internal/gitflow"
+)
 
-const branchFormat = "%(refname:short)|%(objectname:short)|%(committerdate:iso8601)|%(upstream:short)"
+// branchFormat sépare ses champs par le caractère de contrôle US (%1f),
+// qui ne peut pas apparaître dans un nom de ref (contrairement à "|").
+const branchFormat = "%(refname)%1f%(committerdate:iso-local)"
 
-func (r *execRepository) Branches() ([]Branch, error) {
-	out, err := r.run("for-each-ref", "--format="+branchFormat, "refs/heads")
+// Branches renvoie les branches analysées : locales, ou celles du remote
+// choisi à l'ouverture (sans son "HEAD" symbolique), sous leur nom court.
+func (r *Repository) Branches() ([]gitflow.Branch, error) {
+	prefix := r.branchRefPrefix()
+	out, err := r.run("for-each-ref", "--format="+branchFormat, prefix)
 	if err != nil {
 		return nil, err
 	}
-	current, _ := r.CurrentBranch()
+	current := r.currentBranch()
 
-	var branches []Branch
+	var branches []gitflow.Branch
+	names := make(map[string]bool)
 	for _, line := range strings.Split(out, "\n") {
-		if line == "" {
+		ref, date, ok := strings.Cut(line, "\x1f")
+		if !ok {
 			continue
 		}
-		parts := strings.SplitN(line, "|", 4)
-		if len(parts) != 4 {
+		name := strings.TrimPrefix(ref, prefix)
+		if name == "HEAD" {
 			continue
 		}
-		branches = append(branches, Branch{
-			Name:       parts[0],
-			Head:       parts[1],
-			CommitDate: parts[2],
-			Upstream:   parts[3],
-			IsHead:     parts[0] == current,
-		})
+		names[name] = true
+		branches = append(branches, gitflow.Branch{Name: name, CommitDate: date, IsHead: name == current})
 	}
+
+	r.mu.Lock()
+	r.branchNames = names
+	r.mu.Unlock()
 	return branches, nil
 }
 
-func (r *execRepository) AheadBehind(base, branch string) (int, int, error) {
-	out, err := r.run("rev-list", "--left-right", "--count", base+"..."+branch)
+// currentBranch renvoie le nom court de la branche analysée qui correspond
+// à la branche extraite : elle-même pour les branches locales ; en mode
+// remote, la branche du remote qu'elle suit (@{u}), ou rien si elle n'en
+// suit aucune de ce remote — une branche distante homonyme n'est pas pour
+// autant la branche courante.
+func (r *Repository) currentBranch() string {
+	if r.remote == "" {
+		current, _ := r.run("branch", "--show-current")
+		return current
+	}
+	upstream, err := r.run("rev-parse", "--symbolic-full-name", "@{u}")
+	if err != nil || !strings.HasPrefix(upstream, r.branchRefPrefix()) {
+		return ""
+	}
+	return strings.TrimPrefix(upstream, r.branchRefPrefix())
+}
+
+// AheadBehind compare branch à base : commits propres à branch, et commits
+// de base absents de branch.
+func (r *Repository) AheadBehind(base, branch string) (int, int, error) {
+	out, err := r.run("rev-list", "--left-right", "--count", r.ref(base)+"..."+r.ref(branch))
 	if err != nil {
 		return 0, 0, err
 	}
@@ -49,6 +69,26 @@ func (r *execRepository) AheadBehind(base, branch string) (int, int, error) {
 	if len(fields) != 2 {
 		return 0, 0, nil
 	}
-	behind, ahead := atoiSafe(fields[0]), atoiSafe(fields[1])
-	return ahead, behind, nil
+	return atoiSafe(fields[1]), atoiSafe(fields[0]), nil
+}
+
+// CountNotIn compte les commits de branch absents de base, commits de
+// fusion exclus.
+func (r *Repository) CountNotIn(branch, base string) (int, error) {
+	out, err := r.run("rev-list", "--count", "--no-merges", r.ref(branch), "--not", r.ref(base))
+	if err != nil {
+		return 0, err
+	}
+	return atoiSafe(out), nil
+}
+
+func atoiSafe(s string) int {
+	n := 0
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }

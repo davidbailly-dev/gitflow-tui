@@ -4,18 +4,14 @@
 package tui
 
 import (
-	"fmt"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"gitflow-tui/internal/git"
 	"gitflow-tui/internal/gitflow"
 )
 
@@ -26,11 +22,24 @@ import (
 // rechargement complet n'est déclenché que si elle a changé.
 const pollInterval = 2 * time.Second
 
+// graphScrollStep est le pas du défilement horizontal de la vue graphe
+// (←/→), en caractères : quatre colonnes du diagramme.
+const graphScrollStep = 4 * cellWidth
+
 // pollTickMsg déclenche une vérification de l'empreinte du dépôt.
 type pollTickMsg struct{}
 
 func pollTick() tea.Cmd {
 	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return pollTickMsg{} })
+}
+
+// fingerprintMsg porte l'empreinte courante du dépôt, calculée en tâche de
+// fond : parcourir les refs sur disque (des milliers en mode remote, ou sur
+// un système de fichiers lent) ne doit pas figer l'interface.
+type fingerprintMsg string
+
+func checkFingerprint(repo Repository) tea.Cmd {
+	return func() tea.Msg { return fingerprintMsg(repo.StateFingerprint()) }
 }
 
 type view int
@@ -52,39 +61,38 @@ const (
 	paneDiff
 )
 
-// graphMode sélectionne ce que montre la vue graphe : l'historique complet
-// (branches supprimées reconstituées, synchronisations minées, alertes
-// détectées en scannant tout le log), ou seulement l'état courant du dépôt
-// (branches locales encore en attente d'une fusion).
-type graphMode int
-
-const (
-	graphHistory graphMode = iota
-	graphLive
-)
-
-// item est une branche prête à être affichée : sa classification GitFlow,
-// ses données git, et son statut par rapport à sa branche parente.
-type item struct {
-	node    gitflow.Node
-	branch  git.Branch
-	ahead   int
-	behind  int
-	commits []git.Commit
+// Repository est ce dont l'interface a besoin du dépôt : son historique, à
+// analyser, et de quoi afficher un commit et surveiller les changements.
+type Repository interface {
+	gitflow.History
+	// Root renvoie la racine du working tree.
+	Root() string
+	// Remote renvoie le remote dont les branches sont analysées, vide pour
+	// les branches locales.
+	Remote() string
+	// Show renvoie le contenu complet d'un commit (git show), statistiques
+	// calibrées pour width colonnes.
+	Show(hash string, width int) (string, error)
+	// StateFingerprint renvoie une empreinte bon marché de l'état des refs,
+	// obtenue sans lancer git : un changement de valeur signale un commit,
+	// une fusion, un changement ou une suppression de branche.
+	StateFingerprint() string
 }
 
+// column est un groupe de branches du panneau de gauche de la vue
+// colonnes (un type GitFlow).
 type column struct {
 	title string
-	items []item
+	items []gitflow.BranchState
 }
 
 // branchRow est une ligne du panneau de gauche de la vue colonnes : soit un
-// en-tête de groupe (non sélectionnable), soit un indicateur "(vide)" pour
-// un groupe sans branche, soit une branche.
+// en-tête de groupe (non sélectionnable, avec le nombre de branches
+// affichées), soit une branche.
 type branchRow struct {
 	header string
-	empty  bool
-	it     item
+	count  int
+	it     gitflow.BranchState
 }
 
 // dataLoadedMsg porte le résultat d'un chargement (initial, manuel via 'r',
@@ -93,24 +101,30 @@ type branchRow struct {
 // l'empreinte courante lors du tick suivant permet de rattraper tout
 // changement survenu pendant le chargement lui-même.
 type dataLoadedMsg struct {
+	report      gitflow.Report
 	columns     []column
-	timeline    timeline
 	fingerprint string
 	err         error
 }
 
-// diffLoadedMsg porte le contenu (git show) du commit demandé. hash permet
-// d'ignorer un résultat devenu obsolète si la sélection a changé entre
-// temps.
+// diffLoadedMsg porte le contenu (git show) du commit demandé et, pour une
+// fusion, les commits qu'elle a apportés. hash permet d'ignorer un résultat
+// devenu obsolète si la sélection a changé entre temps.
 type diffLoadedMsg struct {
-	hash    string
-	content string
-	err     error
+	hash   string
+	merged []gitflow.Commit
+	show   string
+	err    error
 }
 
 // Model est le modèle racine Bubble Tea de gitflow-tui.
 type Model struct {
-	repo git.Repository
+	repo Repository
+	opts Options
+	// report est le résultat de la dernière analyse du dépôt ; son
+	// classifieur porte les conventions GitFlow du dépôt (noms des branches
+	// permanentes, préfixes).
+	report gitflow.Report
 
 	width, height int
 
@@ -136,11 +150,25 @@ type Model struct {
 	filter    string
 	filtering bool
 
-	timeline timeline
-	graph    viewport.Model
+	graph viewport.Model
+	// graphX est le décalage horizontal (en colonnes de caractères) de la
+	// vue graphe, dont les lignes dépassent souvent la largeur du terminal.
+	graphX int
+	// graphSelKey identifie la ligne de branche sélectionnée dans le graphe
+	// (cf. laneKey) ; graphAnchors situe les lignes du dernier rendu.
+	graphSelKey  string
+	graphAnchors []graphAnchor
 
 	diff    viewport.Model
 	diffFor string
+	// diffMerged et diffShow gardent le contenu brut du commit affiché, pour
+	// le remettre en forme (retour à la ligne) quand la largeur change.
+	diffMerged []gitflow.Commit
+	diffShow   string
+
+	// loadedAt est l'heure du dernier chargement réussi, affichée dans
+	// l'en-tête.
+	loadedAt time.Time
 
 	showHelp bool
 	loading  bool
@@ -155,9 +183,10 @@ type Model struct {
 }
 
 // New construit le modèle initial pour le dépôt donné.
-func New(repo git.Repository) Model {
+func New(repo Repository, opts Options) Model {
 	return Model{
 		repo:              repo,
+		opts:              opts,
 		view:              viewColumns,
 		graph:             viewport.New(0, 0),
 		diff:              viewport.New(0, 0),
@@ -167,154 +196,220 @@ func New(repo git.Repository) Model {
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadData(m.repo), pollTick())
+	return tea.Batch(loadData(m.repo, m.opts), pollTick())
 }
 
-func loadData(repo git.Repository) tea.Cmd {
+// Options règle le comportement de l'interface.
+type Options struct {
+	// StaleAfter est la durée sans commit au-delà de laquelle une branche
+	// éphémère pas encore complètement fusionnée est signalée comme
+	// inactive ; 0 désactive ce signalement.
+	StaleAfter time.Duration
+}
+
+// loadData analyse le dépôt en tâche de fond.
+func loadData(repo Repository, opts Options) tea.Cmd {
 	return func() tea.Msg {
 		fingerprint := repo.StateFingerprint()
-
-		branches, err := repo.Branches()
+		report, err := gitflow.Analyze(repo, gitflow.Options{StaleAfter: opts.StaleAfter, Now: time.Now()})
 		if err != nil {
 			return dataLoadedMsg{fingerprint: fingerprint, err: err}
 		}
-
-		names := make([]string, len(branches))
-		byName := make(map[string]git.Branch, len(branches))
-		for i, b := range branches {
-			names[i] = b.Name
-			byName[b.Name] = b
-		}
-
-		nodes := gitflow.Classify(names)
-
-		toItem := func(n gitflow.Node) item {
-			it := item{node: n, branch: byName[n.Name]}
-			if n.Parent != "" {
-				if ahead, behind, err := repo.AheadBehind(n.Parent, n.Name); err == nil {
-					it.ahead, it.behind = ahead, behind
-				}
-				if commits, err := repo.CommitsNotIn(n.Name, n.Parent); err == nil {
-					it.commits = commits
-				}
-			} else if commits, err := repo.FirstParentCommits(n.Name); err == nil {
-				it.commits = commits
-			}
-			return it
-		}
-
-		var mains, develops, features, releases, hotfixes, others []gitflow.Node
-
-		for _, n := range nodes {
-			switch n.Type {
-			case gitflow.TypeMain:
-				mains = append(mains, n)
-			case gitflow.TypeDevelop:
-				develops = append(develops, n)
-			case gitflow.TypeFeature:
-				features = append(features, n)
-			case gitflow.TypeRelease:
-				releases = append(releases, n)
-			case gitflow.TypeHotfix:
-				hotfixes = append(hotfixes, n)
-			default:
-				others = append(others, n)
-			}
-		}
-
-		byName2 := func(ns []gitflow.Node) func(i, j int) bool {
-			return func(i, j int) bool { return ns[i].Name < ns[j].Name }
-		}
-		sort.Slice(mains, byName2(mains))
-		sort.Slice(develops, byName2(develops))
-		sort.Slice(features, byName2(features))
-		sort.Slice(releases, byName2(releases))
-		sort.Slice(hotfixes, byName2(hotfixes))
-		sort.Slice(others, byName2(others))
-
-		build := func(ns []gitflow.Node) []item {
-			its := make([]item, 0, len(ns))
-			for _, n := range ns {
-				its = append(its, toItem(n))
-			}
-			return its
-		}
-
-		cols := []column{
-			{title: "main", items: build(mains)},
-			{title: "develop", items: build(develops)},
-			{title: "feature/*", items: build(features)},
-			{title: "release/*", items: build(releases)},
-			{title: "hotfix/*", items: build(hotfixes)},
-			{title: "autre", items: build(others)},
-		}
-
-		tl := buildTimeline(repo, nodes, byName)
-
-		return dataLoadedMsg{columns: cols, timeline: tl, fingerprint: fingerprint}
+		return dataLoadedMsg{report: report, columns: branchColumns(report), fingerprint: fingerprint}
 	}
+}
+
+// branchColumns groupe les branches par type GitFlow pour le panneau de
+// gauche de la vue colonnes, titrés d'après les préfixes du dépôt ; main
+// puis develop en tête, dans le groupe des permanentes.
+func branchColumns(r gitflow.Report) []column {
+	cfg := r.Classifier.Config
+	groups := []struct {
+		title string
+		types []gitflow.BranchType
+	}{
+		{"permanentes", []gitflow.BranchType{gitflow.TypeMain, gitflow.TypeDevelop}},
+		{cfg.FeaturePrefix + "*", []gitflow.BranchType{gitflow.TypeFeature}},
+		{cfg.BugfixPrefix + "*", []gitflow.BranchType{gitflow.TypeBugfix}},
+		{cfg.ReleasePrefix + "*", []gitflow.BranchType{gitflow.TypeRelease}},
+		{cfg.HotfixPrefix + "*", []gitflow.BranchType{gitflow.TypeHotfix}},
+		{cfg.SupportPrefix + "*", []gitflow.BranchType{gitflow.TypeSupport}},
+		{"autre", []gitflow.BranchType{gitflow.TypeOther}},
+	}
+	cols := make([]column, 0, len(groups))
+	for _, g := range groups {
+		col := column{title: g.title}
+		for _, t := range g.types {
+			for _, st := range r.Branches {
+				if st.Node.Type == t {
+					col.items = append(col.items, st)
+				}
+			}
+		}
+		cols = append(cols, col)
+	}
+	return cols
 }
 
 // currentGraphContent rend la vue graphe selon le mode actif, sans refaire
 // d'appel git : historique complet, ou seulement l'état courant du dépôt.
-func (m Model) currentGraphContent() string {
-	tl := m.timeline
+func (m Model) currentGraphContent() (string, []graphAnchor) {
 	emptyMsg := "Aucune branche feature/release/hotfix, active ou fusionnée."
 	switch {
 	case m.graphMode == graphLive:
-		tl = filterLive(tl)
 		emptyMsg = "Aucune branche en attente de fusion pour le moment."
 	case m.historyAlertsOnly:
-		tl = filterAlerts(tl)
 		emptyMsg = "Historique propre : aucune déviation du workflow GitFlow détectée."
 	}
-	return renderTimeline(tl, emptyMsg)
+	g := newGraphData(m.report, m.graphMode, m.historyAlertsOnly)
+	return renderGraph(g, emptyMsg, m.graphSelKey)
 }
 
 // loadDiff récupère en tâche de fond le contenu complet (git show) du commit
-// c. Si c'est une fusion, la liste des commits qu'elle a apportés (souvent
-// invisibles dans l'historique premier-parent de main/develop) est ajoutée
-// avant le diff, puisque celui-ci est en pratique peu informatif pour une
-// fusion propre (git montre alors un diff combiné, généralement vide).
-func loadDiff(repo git.Repository, c git.Commit, width int) tea.Cmd {
+// c. Si c'est une fusion, les commits qu'elle a apportés (souvent
+// invisibles dans l'historique premier-parent de main/develop) sont
+// récupérés aussi, pour être affichés avant le diff, puisque celui-ci est en
+// pratique peu informatif pour une fusion propre (git montre alors un diff
+// combiné, généralement vide).
+func loadDiff(repo Repository, c gitflow.Commit, width int) tea.Cmd {
 	return func() tea.Msg {
-		var b strings.Builder
-		if c.IsMerge {
-			if commits, err := repo.MergeCommits(c.Hash); err == nil && len(commits) > 0 {
-				b.WriteString(renderMergedCommits(commits, width))
-				b.WriteString("\n")
+		var merged []gitflow.Commit
+		if c.IsMerge() {
+			if commits, err := repo.CommitsBetween(c.Parents[0], c.Parents[1]); err == nil {
+				merged = commits
 			}
 		}
-		content, err := repo.Show(c.Hash)
+		show, err := repo.Show(c.Hash, width)
 		if err != nil {
 			return diffLoadedMsg{hash: c.Hash, err: err}
 		}
-		b.WriteString(content)
-		return diffLoadedMsg{hash: c.Hash, content: b.String()}
+		return diffLoadedMsg{hash: c.Hash, merged: merged, show: show}
 	}
 }
 
-// renderMergedCommits liste les commits apportés par une fusion. Chaque
-// ligne est tronquée à width plutôt que laissée au retour à la ligne
-// automatique du viewport : ce dernier ne réapplique pas toujours la
-// couleur sur la partie repliée, qui apparaît alors en blanc.
-func renderMergedCommits(commits []git.Commit, width int) string {
-	if width < 1 {
-		width = 1
+// refreshDiff remet en forme le contenu du commit affiché pour la largeur
+// actuelle du panneau, sans changer la position de défilement.
+func (m *Model) refreshDiff() {
+	if m.diffShow == "" {
+		return
 	}
-	headerStyle := lipgloss.NewStyle().Foreground(colorWarning)
-	commitStyle := lipgloss.NewStyle().Foreground(colorFeature)
+	m.diff.SetContent(renderDiff(m.diffMerged, m.diffShow, m.diff.Width))
+}
 
-	// Format volontairement court (pas de date) pour limiter le retour à la
-	// ligne dans le panneau, plus étroit qu'un terminal plein écran.
-	var b strings.Builder
-	header := ansi.Truncate(fmt.Sprintf("⑂ %d commit(s) fusionné(s) :", len(commits)), width, "…")
-	fmt.Fprintf(&b, "%s\n", headerStyle.Render(header))
-	for _, mc := range commits {
-		line := ansi.Truncate(fmt.Sprintf("· %s %s", mc.Hash, mc.Subject), width, "…")
-		fmt.Fprintf(&b, "%s\n", commitStyle.Render(line))
+// graphLegend résume les symboles du graphe, en tête de la vue.
+var graphLegend = styleFaint.Render("● courante  ○ en cours  ✔ fusionnée  × supprimée  ⚠ écart GitFlow  —  ? : légende complète")
+
+// refreshGraph recalcule la vue graphe et la découpe horizontalement selon
+// graphX : chaque ligne est tronquée à la largeur du terminal (avec "…")
+// plutôt que renvoyée à la ligne par le viewport, ce qui casserait
+// l'alignement du diagramme. Au-delà de la marge de gauche, figée (noms des
+// lignes permanentes, année), le diagramme défile de graphX colonnes.
+func (m *Model) refreshGraph() {
+	content, anchors := m.currentGraphContent()
+	// La ligne sélectionnée a pu disparaître (filtre, rechargement) : se
+	// rabattre sur la première, puis refaire le rendu pour la surligner.
+	if len(anchors) > 0 && m.graphAnchorIndex(anchors) < 0 {
+		m.graphSelKey = laneKey(anchors[0].lane)
+		content, anchors = m.currentGraphContent()
 	}
-	return b.String()
+	m.graphAnchors = anchors
+	lines := strings.Split(content, "\n")
+	widest := 0
+	for _, l := range lines {
+		widest = maxInt(widest, ansi.StringWidth(l))
+	}
+	width := maxInt(m.graph.Width, 1)
+	m.graphX = maxInt(0, minInt(m.graphX, widest-width))
+	for i, l := range lines {
+		if m.graphX > 0 {
+			margin := ansi.Truncate(l, laneLabelWidth, "")
+			margin += strings.Repeat(" ", laneLabelWidth-ansi.StringWidth(margin))
+			l = margin + cutLeft(l, laneLabelWidth+m.graphX)
+		}
+		lines[i] = ansi.Truncate(l, width, "…")
+	}
+	legend := ansi.Truncate(graphLegend, width, "…")
+	m.graph.SetContent(legend + "\n\n" + strings.Join(lines, "\n"))
+
+	// Faire défiler juste ce qu'il faut pour garder la ligne sélectionnée
+	// visible (la légende et la ligne vide qui la suit la décalent de 2).
+	if i := m.graphAnchorIndex(anchors); i >= 0 {
+		line := anchors[i].line + 2
+		switch {
+		case line < m.graph.YOffset:
+			m.graph.SetYOffset(line)
+		case line >= m.graph.YOffset+m.graph.Height:
+			m.graph.SetYOffset(line - m.graph.Height + 1)
+		}
+	}
+}
+
+// graphAnchorIndex renvoie la position de la ligne sélectionnée parmi
+// anchors, ou -1.
+func (m Model) graphAnchorIndex(anchors []graphAnchor) int {
+	for i, a := range anchors {
+		if laneKey(a.lane) == m.graphSelKey {
+			return i
+		}
+	}
+	return -1
+}
+
+// moveGraphSelection sélectionne la ligne de branche d vers le bas (ou vers
+// le haut si d < 0) dans le graphe, sans boucler.
+func (m *Model) moveGraphSelection(d int) {
+	if len(m.graphAnchors) == 0 {
+		return
+	}
+	i := m.graphAnchorIndex(m.graphAnchors) + d
+	i = maxInt(0, minInt(i, len(m.graphAnchors)-1))
+	m.graphSelKey = laneKey(m.graphAnchors[i].lane)
+	m.refreshGraph()
+}
+
+// openGraphSelection ouvre la ligne sélectionnée du graphe dans la vue
+// colonnes : la branche elle-même si elle existe encore, sinon (branche
+// supprimée, synchronisation) son commit de fusion, dans la branche qui
+// l'a reçue.
+func (m *Model) openGraphSelection() tea.Cmd {
+	i := m.graphAnchorIndex(m.graphAnchors)
+	if i < 0 {
+		return nil
+	}
+	l := m.graphAnchors[i].lane
+	if l.Kind == gitflow.LaneLive {
+		return m.openBranch(l.Node.Name, "")
+	}
+	for _, refs := range [][]gitflow.MergeRef{l.Merged, l.Unexpected} {
+		for _, mr := range refs {
+			if mr.Hash != "" {
+				return m.openBranch(mr.Target, mr.Hash)
+			}
+		}
+	}
+	return nil
+}
+
+// openBranch bascule sur la vue colonnes, la branche name sélectionnée
+// (filtre levé au besoin pour qu'elle soit visible) et, si commitHash est
+// renseigné, ce commit sélectionné dans sa liste, focus sur les commits.
+func (m *Model) openBranch(name, commitHash string) tea.Cmd {
+	m.filter = ""
+	m.view = viewColumns
+	m.paneFocus = paneCommits
+	m.selectedBranchName = name
+	m.restoreBranchSelection()
+	m.commitIdx = 0
+	if it, ok := m.selectedBranchRow(); ok && commitHash != "" {
+		for i, c := range it.Commits {
+			if c.Hash == commitHash {
+				m.commitIdx = i
+				break
+			}
+		}
+	}
+	m.syncSelectedCommitHash()
+	return m.syncDiff()
 }
 
 // paneContentHeight renvoie la hauteur de contenu disponible pour chacun
@@ -377,6 +472,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		_, _, diffWidth := m.paneWidths()
 		m.diff.Width = diffWidth - 2
 		m.diff.Height = m.paneContentHeight() - 1
+		m.refreshDiff()
+		m.refreshGraph()
 		return m, nil
 
 	case dataLoadedMsg:
@@ -388,22 +485,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.lastFingerprint = msg.fingerprint
 		m.columns = msg.columns
-		m.timeline = msg.timeline
-		m.graph.SetContent(m.currentGraphContent())
+		m.report = msg.report
+		m.loadedAt = time.Now()
+		m.refreshGraph()
 		m.restoreBranchSelection()
 		m.restoreCommitSelection()
 		return m, m.syncDiff()
 
 	case pollTickMsg:
-		next := pollTick()
+		// Une seule vérification à la fois : le tick suivant n'est programmé
+		// qu'une fois celle-ci terminée (fingerprintMsg).
 		if m.loading || m.refreshing {
-			return m, next
+			return m, pollTick()
 		}
-		if m.repo.StateFingerprint() == m.lastFingerprint {
+		return m, checkFingerprint(m.repo)
+
+	case fingerprintMsg:
+		next := pollTick()
+		if m.loading || m.refreshing || string(msg) == m.lastFingerprint {
 			return m, next
 		}
 		m.refreshing = true
-		return m, tea.Batch(next, loadData(m.repo))
+		return m, tea.Batch(next, loadData(m.repo, m.opts))
 
 	case diffLoadedMsg:
 		if msg.hash != m.diffFor {
@@ -412,7 +515,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.diff.SetContent(styleFaint.Render("Erreur : " + msg.err.Error()))
 		} else {
-			m.diff.SetContent(msg.content)
+			m.diffMerged, m.diffShow = msg.merged, msg.show
+			m.refreshDiff()
 		}
 		// SetContent ne réinitialise pas le défilement : sans ça, la
 		// position laissée par un diff précédent (parfois déjà tout en bas)
@@ -429,6 +533,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.filtering {
 		switch msg.Type {
+		case tea.KeyCtrlC:
+			return m, tea.Quit
 		case tea.KeyEsc:
 			m.filtering = false
 			m.filter = ""
@@ -454,9 +560,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = !m.showHelp
 		return m, nil
 	case key.Matches(msg, keys.Refresh):
-		m.loading = true
+		// Les données actuelles restent affichées pendant le rechargement
+		// (seul l'en-tête le signale), comme pour le rafraîchissement
+		// automatique ; inutile d'en lancer un second s'il est déjà en cours.
+		if m.refreshing {
+			return m, nil
+		}
 		m.refreshing = true
-		return m, loadData(m.repo)
+		return m, loadData(m.repo, m.opts)
 	case key.Matches(msg, keys.Tab):
 		if m.view == viewColumns {
 			m.view = viewGraph
@@ -471,13 +582,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			} else {
 				m.graphMode = graphHistory
 			}
-			m.graph.SetContent(m.currentGraphContent())
+			m.refreshGraph()
 		}
 		return m, nil
 	case key.Matches(msg, keys.Alerts):
 		if m.view == viewGraph && m.graphMode == graphHistory {
 			m.historyAlertsOnly = !m.historyAlertsOnly
-			m.graph.SetContent(m.currentGraphContent())
+			m.refreshGraph()
 		}
 		return m, nil
 	case key.Matches(msg, keys.Filter):
@@ -488,6 +599,24 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	if m.view == viewGraph {
+		switch {
+		case key.Matches(msg, keys.Left):
+			m.graphX -= graphScrollStep
+			m.refreshGraph()
+			return m, nil
+		case key.Matches(msg, keys.Right):
+			m.graphX += graphScrollStep
+			m.refreshGraph()
+			return m, nil
+		case key.Matches(msg, keys.Up) && len(m.graphAnchors) > 0:
+			m.moveGraphSelection(-1)
+			return m, nil
+		case key.Matches(msg, keys.Down) && len(m.graphAnchors) > 0:
+			m.moveGraphSelection(1)
+			return m, nil
+		case key.Matches(msg, keys.Open):
+			return m, m.openGraphSelection()
+		}
 		var cmd tea.Cmd
 		m.graph, cmd = m.graph.Update(msg)
 		return m, cmd
@@ -564,7 +693,7 @@ func (m *Model) moveCommit(d int) {
 	if !ok {
 		return
 	}
-	n := len(it.commits)
+	n := len(it.Commits)
 	if n == 0 {
 		return
 	}
@@ -578,6 +707,7 @@ func (m *Model) syncDiff() tea.Cmd {
 	c, ok := m.selectedCommit()
 	if !ok {
 		m.diffFor = ""
+		m.diffMerged, m.diffShow = nil, ""
 		m.diff.SetContent(styleFaint.Render("Aucun commit sélectionné."))
 		m.diff.GotoTop()
 		return nil
@@ -586,13 +716,14 @@ func (m *Model) syncDiff() tea.Cmd {
 		return nil
 	}
 	m.diffFor = c.Hash
+	m.diffMerged, m.diffShow = nil, ""
 	m.diff.SetContent(styleFaint.Render("Chargement..."))
 	m.diff.GotoTop()
 	return loadDiff(m.repo, c, m.diff.Width)
 }
 
 func selectableRow(rows []branchRow, i int) bool {
-	return i >= 0 && i < len(rows) && rows[i].header == "" && !rows[i].empty
+	return i >= 0 && i < len(rows) && rows[i].header == ""
 }
 
 // ensureBranchSelection fait sauter la sélection vers la première branche
@@ -618,13 +749,24 @@ func (m *Model) ensureBranchSelection() {
 // restoreBranchSelection retrouve, après un rechargement des données, la
 // ligne correspondant à la branche qui était sélectionnée avant coup — par
 // son nom, pas son index, puisqu'une branche ajoutée ou supprimée décale
-// les positions sans changer les noms des autres. Si cette branche n'existe
-// plus (supprimée entre-temps), retombe sur la première branche visible.
+// les positions sans changer les noms des autres. Au premier chargement,
+// aucune branche n'est encore retenue : la sélection part de la branche
+// courante (HEAD). Si la branche retenue n'existe plus (supprimée
+// entre-temps), retombe sur la première branche visible.
 func (m *Model) restoreBranchSelection() {
 	rows := m.flatBranches()
+	if m.selectedBranchName == "" {
+		for i, row := range rows {
+			if selectableRow(rows, i) && row.it.Branch.IsHead {
+				m.branchIdx = i
+				m.syncSelectedBranchName()
+				return
+			}
+		}
+	}
 	if m.selectedBranchName != "" {
 		for i, row := range rows {
-			if selectableRow(rows, i) && row.it.node.Name == m.selectedBranchName {
+			if selectableRow(rows, i) && row.it.Node.Name == m.selectedBranchName {
 				m.branchIdx = i
 				return
 			}
@@ -639,7 +781,7 @@ func (m *Model) restoreBranchSelection() {
 func (m *Model) syncSelectedBranchName() {
 	rows := m.flatBranches()
 	if selectableRow(rows, m.branchIdx) {
-		m.selectedBranchName = rows[m.branchIdx].it.node.Name
+		m.selectedBranchName = rows[m.branchIdx].it.Node.Name
 	}
 }
 
@@ -656,7 +798,7 @@ func (m *Model) restoreCommitSelection() {
 		return
 	}
 	if m.selectedCommitHash != "" {
-		for i, c := range it.commits {
+		for i, c := range it.Commits {
 			if c.Hash == m.selectedCommitHash {
 				m.commitIdx = i
 				return
@@ -678,14 +820,14 @@ func (m *Model) syncSelectedCommitHash() {
 	}
 }
 
-func (m Model) visibleItems(col column) []item {
+func (m Model) visibleItems(col column) []gitflow.BranchState {
 	if m.filter == "" {
 		return col.items
 	}
 	needle := strings.ToLower(m.filter)
-	out := make([]item, 0, len(col.items))
+	out := make([]gitflow.BranchState, 0, len(col.items))
 	for _, it := range col.items {
-		if strings.Contains(strings.ToLower(it.node.Name), needle) {
+		if strings.Contains(strings.ToLower(it.Node.Name), needle) {
 			out = append(out, it)
 		}
 	}
@@ -694,16 +836,16 @@ func (m Model) visibleItems(col column) []item {
 
 // flatBranches aplatit les colonnes groupées par type GitFlow en une liste
 // unique de lignes pour le panneau de gauche de la vue colonnes : un en-tête
-// par groupe, un indicateur "(vide)" si le groupe filtré n'a plus de
-// résultat, puis ses branches.
+// par groupe (avec son nombre de branches), puis ses branches. Les groupes
+// sans branche — ou sans résultat pour le filtre en cours — sont omis.
 func (m Model) flatBranches() []branchRow {
 	var rows []branchRow
 	for _, col := range m.columns {
-		rows = append(rows, branchRow{header: col.title})
 		items := m.visibleItems(col)
 		if len(items) == 0 {
-			rows = append(rows, branchRow{empty: true})
+			continue
 		}
+		rows = append(rows, branchRow{header: col.title, count: len(items)})
 		for _, it := range items {
 			rows = append(rows, branchRow{it: it})
 		}
@@ -711,22 +853,22 @@ func (m Model) flatBranches() []branchRow {
 	return rows
 }
 
-func (m Model) selectedBranchRow() (item, bool) {
+func (m Model) selectedBranchRow() (gitflow.BranchState, bool) {
 	rows := m.flatBranches()
 	if !selectableRow(rows, m.branchIdx) {
-		return item{}, false
+		return gitflow.BranchState{}, false
 	}
 	return rows[m.branchIdx].it, true
 }
 
-func (m Model) selectedCommit() (git.Commit, bool) {
+func (m Model) selectedCommit() (gitflow.Commit, bool) {
 	it, ok := m.selectedBranchRow()
-	if !ok || len(it.commits) == 0 {
-		return git.Commit{}, false
+	if !ok || len(it.Commits) == 0 {
+		return gitflow.Commit{}, false
 	}
 	idx := m.commitIdx
-	if idx < 0 || idx >= len(it.commits) {
+	if idx < 0 || idx >= len(it.Commits) {
 		idx = 0
 	}
-	return it.commits[idx], true
+	return it.Commits[idx], true
 }
