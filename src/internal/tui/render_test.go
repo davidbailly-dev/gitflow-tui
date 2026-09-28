@@ -75,3 +75,23 @@ func TestNewGraphDataModes(t *testing.T) {
 		t.Errorf("direct : %v (commits directs %d), attendu les 2 branches en cours, sans commit direct", got, len(live.developDirect))
 	}
 }
+
+// La sélection suit une branche qui est fusionnée, puis supprimée, pendant
+// qu'on la regarde ; deux synchronisations restent distinctes.
+func TestLaneKeyIsStable(t *testing.T) {
+	live := graphLane{Lane: gitflow.Lane{Node: gitflow.Node{Name: "feature/x"}, Kind: gitflow.LaneLive, Date: "2026-05-01 10:00:00 +0200"}}
+	merged := live
+	merged.Date = "2026-05-03 10:00:00 +0200"
+	deleted := merged
+	deleted.Kind = gitflow.LaneDeleted
+	if laneKey(live) != laneKey(merged) || laneKey(merged) != laneKey(deleted) {
+		t.Error("la clé d'une branche change avec son état")
+	}
+
+	sync1 := graphLane{Lane: gitflow.Lane{Node: gitflow.Node{Name: "develop → main"}, Kind: gitflow.LaneSync, Date: "2026-05-01 10:00:00 +0200"}}
+	sync2 := sync1
+	sync2.Date = "2026-06-01 10:00:00 +0200"
+	if laneKey(sync1) == laneKey(sync2) {
+		t.Error("deux synchronisations ont la même clé")
+	}
+}

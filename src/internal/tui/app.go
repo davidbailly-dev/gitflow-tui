@@ -33,6 +33,15 @@ func pollTick() tea.Cmd {
 	return tea.Tick(pollInterval, func(time.Time) tea.Msg { return pollTickMsg{} })
 }
 
+// fingerprintMsg porte l'empreinte courante du dépôt, calculée en tâche de
+// fond : parcourir les refs sur disque (des milliers en mode remote, ou sur
+// un système de fichiers lent) ne doit pas figer l'interface.
+type fingerprintMsg string
+
+func checkFingerprint(repo Repository) tea.Cmd {
+	return func() tea.Msg { return fingerprintMsg(repo.StateFingerprint()) }
+}
+
 type view int
 
 const (
@@ -484,11 +493,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, m.syncDiff()
 
 	case pollTickMsg:
-		next := pollTick()
+		// Une seule vérification à la fois : le tick suivant n'est programmé
+		// qu'une fois celle-ci terminée (fingerprintMsg).
 		if m.loading || m.refreshing {
-			return m, next
+			return m, pollTick()
 		}
-		if m.repo.StateFingerprint() == m.lastFingerprint {
+		return m, checkFingerprint(m.repo)
+
+	case fingerprintMsg:
+		next := pollTick()
+		if m.loading || m.refreshing || string(msg) == m.lastFingerprint {
 			return m, next
 		}
 		m.refreshing = true

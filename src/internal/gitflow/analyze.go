@@ -47,23 +47,17 @@ func Analyze(h History, opts Options) (Report, error) {
 	_, hasMain := byName[classifier.Main]
 	_, hasDevelop := byName[classifier.Develop]
 
-	// Lignes permanentes, fusions qu'elles ont reçues, tags : lectures
-	// globales, indépendantes les unes des autres.
-	var mainLog, developLog, mainMerges, developMerges []Commit
+	// Lignes permanentes (qui portent aussi les fusions qu'elles ont reçues)
+	// et tags : lectures globales, indépendantes les unes des autres.
+	var mainLog, developLog []Commit
 	var tags map[string][]string
 	var developAhead, developBehind int
 	var tasks []func()
 	if hasMain {
-		tasks = append(tasks,
-			func() { mainLog, _ = h.FirstParentLog(classifier.Main) },
-			func() { mainMerges, _ = h.MergeLog(classifier.Main) },
-		)
+		tasks = append(tasks, func() { mainLog, _ = h.FirstParentLog(classifier.Main) })
 	}
 	if hasDevelop {
-		tasks = append(tasks,
-			func() { developLog, _ = h.FirstParentLog(classifier.Develop) },
-			func() { developMerges, _ = h.MergeLog(classifier.Develop) },
-		)
+		tasks = append(tasks, func() { developLog, _ = h.FirstParentLog(classifier.Develop) })
 	}
 	if hasMain && hasDevelop {
 		tasks = append(tasks,
@@ -79,12 +73,12 @@ func Analyze(h History, opts Options) (Report, error) {
 	if hasMain {
 		report.Main = &Spine{Branch: byName[classifier.Main], Log: mainLog, Direct: directCommits(mainLog)}
 		a.spines[classifier.Main] = hashSet(mainLog)
-		a.merges[classifier.Main] = a.ephemeralMerges(classifier.Main, mainMerges)
+		a.merges[classifier.Main] = a.ephemeralMerges(classifier.Main, mainLog)
 	}
 	if hasDevelop {
 		report.Develop = &Spine{Branch: byName[classifier.Develop], Log: developLog, Direct: directCommits(developLog)}
 		a.spines[classifier.Develop] = hashSet(developLog)
-		a.merges[classifier.Develop] = a.ephemeralMerges(classifier.Develop, developMerges)
+		a.merges[classifier.Develop] = a.ephemeralMerges(classifier.Develop, developLog)
 	}
 	report.Unreleased = developAhead
 
@@ -139,7 +133,7 @@ func Analyze(h History, opts Options) (Report, error) {
 	sort.Strings(mentioned)
 	var syncs []MergeRef
 	if hasMain && hasDevelop {
-		syncs = syncMerges(classifier.Main, classifier.Develop, a.spines[classifier.Main], mainMerges)
+		syncs = syncMerges(classifier.Main, classifier.Develop, mainLog)
 	}
 	history := make([]*Lane, len(mentioned)+len(syncs))
 	parallel(len(history), func(i int) {
@@ -294,18 +288,17 @@ func mergeRefOf(target string, c Commit) MergeRef {
 }
 
 // ephemeralMerges groupe par branche source les fusions de branches
-// feature/bugfix/release/hotfix reçues par target, parmi merges, les
-// commits de fusion atteignables depuis target. Seules comptent celles de
-// sa ligne directe : les autres ont été faites ailleurs (dans develop, dans
-// une release…) et ne sont arrivées dans target qu'avec la branche qui les
-// contenait — la fusion d'une release dans develop, atteignable depuis main
-// après la release suivante, n'est pas une fusion dans main. Un git pull
-// (fusion d'une branche dans sa propre copie) n'en est pas une non plus.
-func (a *analysis) ephemeralMerges(target string, merges []Commit) map[string][]MergeRef {
+// feature/bugfix/release/hotfix reçues par target, d'après sa ligne directe
+// log. Seules comptent les fusions de cette ligne directe : les autres ont
+// été faites ailleurs (dans develop, dans une release…) et ne sont arrivées
+// dans target qu'avec la branche qui les contenait — la fusion d'une
+// release dans develop, atteignable depuis main après la release suivante,
+// n'est pas une fusion dans main. Un git pull (fusion d'une branche dans sa
+// propre copie) n'en est pas une non plus.
+func (a *analysis) ephemeralMerges(target string, log []Commit) map[string][]MergeRef {
 	events := make(map[string][]MergeRef)
-	spine := a.spines[target]
-	for _, c := range merges {
-		if !spine[c.Hash] {
+	for _, c := range log {
+		if !c.IsMerge() {
 			continue
 		}
 		m, ok := ParseMerge(c.Subject)
@@ -317,15 +310,15 @@ func (a *analysis) ephemeralMerges(target string, merges []Commit) map[string][]
 	return events
 }
 
-// syncMerges retrouve, parmi les commits de fusion atteignables depuis
-// main, chaque fusion de develop dans main (message git standard, ou merge
-// de pull request), c'est-à-dire sur la ligne directe de main (mainSpine).
-// Les fusions de develop vers une autre branche (ex. une feature mise à
-// jour depuis develop), également atteignables depuis main, sont écartées.
-func syncMerges(mainName, developName string, mainSpine map[string]bool, mainMerges []Commit) []MergeRef {
+// syncMerges retrouve, sur la ligne directe de main (mainLog), chaque
+// fusion de develop dans main (message git standard, ou merge de pull
+// request). Une fusion de develop vers une autre branche (ex. une feature
+// mise à jour depuis develop) n'est pas sur cette ligne, sauf si son
+// message désigne explicitement une autre cible.
+func syncMerges(mainName, developName string, mainLog []Commit) []MergeRef {
 	var out []MergeRef
-	for _, c := range mainMerges {
-		if !mainSpine[c.Hash] {
+	for _, c := range mainLog {
+		if !c.IsMerge() {
 			continue
 		}
 		m, ok := ParseMerge(c.Subject)
@@ -360,6 +353,11 @@ func nearestMatch(chain []Commit, sets ...map[string]bool) int {
 // différence avec la parente, cela reste vrai une fois la branche
 // fusionnée, quand sa parente contient tous ses commits.
 func (a *analysis) ownCommits(chain []Commit) []Commit {
+	if len(a.spines) == 0 {
+		// Dépôt sans main ni develop : aucun point de divergence à chercher,
+		// tout l'historique de la branche est le sien.
+		return chain
+	}
 	sets := make([]map[string]bool, 0, len(a.spines))
 	for _, set := range a.spines {
 		sets = append(sets, set)
@@ -398,24 +396,43 @@ func (a *analysis) divergence(n Node, chain []Commit) (fork Commit, found bool, 
 	return Commit{}, false, ""
 }
 
-// laneDate renvoie la position d'une ligne sur l'axe du temps : la date de
-// sa première intégration connue (fusion vers une cible valide ou non),
-// sinon fallback — le point de divergence d'une branche pas encore
-// fusionnée. Toutes les dates sont au même format (ISO, fuseau local) et se
-// comparent donc comme des chaînes.
-func laneDate(merged, unexpected []MergeRef, fallback string) string {
+// firstIntegration renvoie la date de la première fusion connue de la
+// branche name dans l'une ou l'autre des branches permanentes (vide si elle
+// n'y a jamais été fusionnée) : la position d'une ligne sur l'axe du temps.
+// Une branche reprise après une première fusion reste placée à cette
+// première fusion.
+func (a *analysis) firstIntegration(name string) string {
 	date := ""
-	for _, refs := range [][]MergeRef{merged, unexpected} {
-		for _, mr := range refs {
-			if mr.Date != "" && (date == "" || mr.Date < date) {
-				date = mr.Date
+	for _, bySource := range a.merges {
+		for _, ev := range bySource[name] {
+			if ev.Date != "" && (date == "" || ev.Date < date) {
+				date = ev.Date
 			}
 		}
 	}
-	if date == "" {
-		return fallback
-	}
 	return date
+}
+
+// mergedCommits renvoie les commits apportés par l'ensemble des fusions
+// events, sans doublon, du plus récent au plus ancien : tout le travail
+// d'une branche fusionnée en plusieurs fois.
+func (a *analysis) mergedCommits(events []MergeRef) []Commit {
+	var out []Commit
+	seen := make(map[string]bool)
+	for _, ev := range events {
+		if ev.Tip == "" {
+			continue
+		}
+		commits, _ := a.h.CommitsBetween(ev.Base, ev.Tip)
+		for _, c := range commits {
+			if !seen[c.Hash] {
+				seen[c.Hash] = true
+				out = append(out, c)
+			}
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].CommitDate > out[j].CommitDate })
+	return out
 }
 
 // liveLane construit la ligne d'une branche éphémère existante : fusions
@@ -431,8 +448,10 @@ func (a *analysis) liveLane(n Node, chain, commits []Commit) Lane {
 			continue
 		}
 		// Une branche sans commit propre (tout juste créée) est trivialement
-		// contenue dans sa parente : ce n'est pas pour autant une fusion.
-		if len(commits) > 0 {
+		// contenue dans sa parente : ce n'est pas pour autant une fusion. Une
+		// cible absente des branches analysées n'est pas interrogée : en mode
+		// remote, git la résoudrait en branche locale homonyme.
+		if _, exists := a.byName[target]; exists && len(commits) > 0 {
 			if merged, err := a.h.IsAncestor(n.Name, target); err == nil && merged {
 				lane.Merged = append(lane.Merged, MergeRef{Target: target})
 				continue
@@ -444,11 +463,15 @@ func (a *analysis) liveLane(n Node, chain, commits []Commit) Lane {
 
 	fork, found, wrongParent := a.divergence(n, chain)
 	lane.WrongParent = wrongParent
-	fallback := branch.CommitDate
-	if found {
-		fallback = fork.CommitDate
+	// Placée à sa première fusion, sinon (pas encore fusionnée) à son point
+	// de divergence.
+	lane.Date = a.firstIntegration(n.Name)
+	if lane.Date == "" {
+		lane.Date = branch.CommitDate
+		if found {
+			lane.Date = fork.CommitDate
+		}
 	}
-	lane.Date = laneDate(lane.Merged, lane.Unexpected, fallback)
 	lane.StaleDays = staleDays(lane, a.opts.StaleAfter, a.opts.Now)
 	return lane
 }
@@ -495,27 +518,30 @@ func (a *analysis) deletedLane(node Node) (Lane, bool) {
 	}
 	sort.Slice(refs, func(i, j int) bool { return refs[i].Date < refs[j].Date })
 
-	// Première fusion réellement identifiée : elle a apporté les commits de
-	// la branche, et son second parent est la pointe de la branche.
-	var known MergeRef
+	// Fusions de référence : celles reçues par la cible de la première
+	// fusion identifiée (valide de préférence). Ensemble, elles ont apporté
+	// tout le travail de la branche, même reprise après une première fusion ;
+	// la plus récente porte sa pointe la plus avancée.
+	known := unexpected
 	if len(refs) > 0 {
-		known = refs[0]
-	} else {
-		known = unexpected[0]
+		known = refs
 	}
+	events := a.merges[known[0].Target][node.Name]
+	tip := events[0].Tip
 
 	// Une cible valide sans fusion identifiée peut malgré tout contenir le
 	// travail de la branche, arrivé par un autre chemin (hotfix fusionné
 	// dans la release en cours, qui a ensuite rejoint develop) : il suffit
 	// de vérifier que la cible contient la pointe de la branche. Sinon la
-	// cible n'a jamais été atteinte.
+	// cible n'a jamais été atteinte. Une cible absente des branches
+	// analysées n'est pas interrogée (cf. liveLane).
 	var pending []string
 	for _, target := range node.MergeTargets {
 		if _, ok := a.merges.latest(target, node.Name); ok {
 			continue
 		}
-		if known.Tip != "" {
-			if merged, err := a.h.IsAncestor(known.Tip, target); err == nil && merged {
+		if _, exists := a.byName[target]; exists && tip != "" {
+			if merged, err := a.h.IsAncestor(tip, target); err == nil && merged {
 				refs = append(refs, MergeRef{Target: target})
 				continue
 			}
@@ -529,10 +555,8 @@ func (a *analysis) deletedLane(node Node) (Lane, bool) {
 		Merged:     refs,
 		Unexpected: unexpected,
 		Pending:    pending,
-		Date:       laneDate(refs, unexpected, ""),
-	}
-	if known.Tip != "" {
-		lane.Commits, _ = a.h.CommitsBetween(known.Base, known.Tip)
+		Date:       a.firstIntegration(node.Name),
+		Commits:    a.mergedCommits(events),
 	}
 	return lane, true
 }

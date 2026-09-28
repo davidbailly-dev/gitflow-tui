@@ -421,3 +421,61 @@ func TestDirectCommitsIgnoreBootstrap(t *testing.T) {
 		t.Errorf("commits directs = %v, attendu [fix: direct]", got)
 	}
 }
+
+// Sans main ni develop, il n'y a pas de point de divergence : chaque branche
+// affiche tout son historique.
+func TestNoPermanentBranchShowsFullHistory(t *testing.T) {
+	h := newFakeHistory(t, "trunk")
+	h.commit("init")
+	h.commit("suite")
+
+	b := branchNamed(t, analyze(t, h), "trunk")
+	if got := subjects(b.Commits); !reflect.DeepEqual(got, []string{"suite", "init"}) {
+		t.Errorf("commits = %v, attendu tout l'historique", got)
+	}
+}
+
+// Une branche reprise après une première fusion : elle reste placée à sa
+// première fusion, et regroupe le travail de ses deux fusions.
+func TestBranchMergedTwice(t *testing.T) {
+	for _, deleted := range []bool{false, true} {
+		h := newGitflowHistory(t)
+		finishFeature(h, "feature/reprise", "feat: première partie")
+		firstMerge := h.commits[h.branches["develop"]].CommitDate
+		finishFeature(h, "feature/autre", "feat: autre")
+		h.checkout("feature/reprise").commit("feat: seconde partie")
+		h.checkout("develop").merge("feature/reprise", "Merge branch 'feature/reprise' into develop")
+		if deleted {
+			h.deleteBranch("feature/reprise")
+		}
+
+		r := analyze(t, h)
+		l := laneNamed(t, r, "feature/reprise")
+		if l.Date != firstMerge {
+			t.Errorf("supprimée=%v : date %q, attendu la première fusion %q", deleted, l.Date, firstMerge)
+		}
+		if got, want := laneNames(r), []string{"feature/reprise", "feature/autre"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("supprimée=%v : ordre %v, attendu %v", deleted, got, want)
+		}
+		want := []string{"feat: seconde partie", "feat: première partie"}
+		if got := subjects(l.Commits); !reflect.DeepEqual(got, want) {
+			t.Errorf("supprimée=%v : commits %v, attendu %v", deleted, got, want)
+		}
+	}
+}
+
+// Une cible de fusion absente des branches analysées n'est pas interrogée
+// (en mode remote, git la résoudrait en branche locale homonyme) : elle
+// reste en attente.
+func TestMissingTargetIsNotQueried(t *testing.T) {
+	h := newFakeHistory(t, "main")
+	h.commit("init")
+	h.checkoutNew("feature/sans-develop")
+	h.commit("feat: x")
+	// Le faux historique échoue sur toute référence inconnue, dont
+	// "develop" si l'analyse l'interrogeait.
+	l := laneNamed(t, analyze(t, h), "feature/sans-develop")
+	if !reflect.DeepEqual(l.Pending, []string{"develop"}) {
+		t.Errorf("en attente = %v, attendu [develop]", l.Pending)
+	}
+}

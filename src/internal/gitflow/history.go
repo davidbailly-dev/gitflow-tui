@@ -19,9 +19,6 @@ type History interface {
 	// FirstParentLog renvoie la ligne directe de ref (en ne suivant que le
 	// premier parent), du plus récent au plus ancien.
 	FirstParentLog(ref string) ([]Commit, error)
-	// MergeLog renvoie tous les commits de fusion atteignables depuis ref,
-	// du plus récent au plus ancien.
-	MergeLog(ref string) ([]Commit, error)
 	// CommitsBetween renvoie les commits atteignables depuis tip mais pas
 	// depuis base, du plus récent au plus ancien : ce qu'une fusion de
 	// premier parent base et de second parent tip a apporté.

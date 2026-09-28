@@ -6,7 +6,9 @@ import (
 	"gitflow-tui/internal/gitflow"
 )
 
-const branchFormat = "%(refname)|%(committerdate:iso-local)"
+// branchFormat sépare ses champs par le caractère de contrôle US (%1f),
+// qui ne peut pas apparaître dans un nom de ref (contrairement à "|").
+const branchFormat = "%(refname)%1f%(committerdate:iso-local)"
 
 // Branches renvoie les branches analysées : locales, ou celles du remote
 // choisi à l'ouverture (sans son "HEAD" symbolique), sous leur nom court.
@@ -16,12 +18,12 @@ func (r *Repository) Branches() ([]gitflow.Branch, error) {
 	if err != nil {
 		return nil, err
 	}
-	current, _ := r.run("branch", "--show-current")
+	current := r.currentBranch()
 
 	var branches []gitflow.Branch
 	names := make(map[string]bool)
 	for _, line := range strings.Split(out, "\n") {
-		ref, date, ok := strings.Cut(line, "|")
+		ref, date, ok := strings.Cut(line, "\x1f")
 		if !ok {
 			continue
 		}
@@ -37,6 +39,23 @@ func (r *Repository) Branches() ([]gitflow.Branch, error) {
 	r.branchNames = names
 	r.mu.Unlock()
 	return branches, nil
+}
+
+// currentBranch renvoie le nom court de la branche analysée qui correspond
+// à la branche extraite : elle-même pour les branches locales ; en mode
+// remote, la branche du remote qu'elle suit (@{u}), ou rien si elle n'en
+// suit aucune de ce remote — une branche distante homonyme n'est pas pour
+// autant la branche courante.
+func (r *Repository) currentBranch() string {
+	if r.remote == "" {
+		current, _ := r.run("branch", "--show-current")
+		return current
+	}
+	upstream, err := r.run("rev-parse", "--symbolic-full-name", "@{u}")
+	if err != nil || !strings.HasPrefix(upstream, r.branchRefPrefix()) {
+		return ""
+	}
+	return strings.TrimPrefix(upstream, r.branchRefPrefix())
 }
 
 // AheadBehind compare branch à base : commits propres à branch, et commits
