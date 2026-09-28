@@ -186,7 +186,8 @@ func loadData(repo git.Repository) tea.Cmd {
 			byName[b.Name] = b
 		}
 
-		nodes := gitflow.Classify(names)
+		classifier := gitflow.NewClassifier(names)
+		nodes := classifier.Classify(names)
 
 		toItem := func(n gitflow.Node) item {
 			it := item{node: n, branch: byName[n.Name]}
@@ -249,7 +250,7 @@ func loadData(repo git.Repository) tea.Cmd {
 			{title: "autre", items: build(others)},
 		}
 
-		tl := buildTimeline(repo, nodes, byName)
+		tl := buildTimeline(repo, classifier, nodes, byName)
 
 		return dataLoadedMsg{columns: cols, timeline: tl, fingerprint: fingerprint}
 	}
@@ -429,6 +430,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.filtering {
 		switch msg.Type {
+		case tea.KeyCtrlC:
+			return m, tea.Quit
 		case tea.KeyEsc:
 			m.filtering = false
 			m.filter = ""
@@ -454,7 +457,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = !m.showHelp
 		return m, nil
 	case key.Matches(msg, keys.Refresh):
-		m.loading = true
+		// Les données actuelles restent affichées pendant le rechargement
+		// (seul l'en-tête le signale), comme pour le rafraîchissement
+		// automatique ; inutile d'en lancer un second s'il est déjà en cours.
+		if m.refreshing {
+			return m, nil
+		}
 		m.refreshing = true
 		return m, loadData(m.repo)
 	case key.Matches(msg, keys.Tab):

@@ -66,12 +66,13 @@ func (r *execRepository) MergeCommits(mergeHash string) ([]Commit, error) {
 	return parseCommits(out), nil
 }
 
-// LogSubjects renvoie, pour chaque commit atteignable depuis ref, une ligne
-// "hash|date|sujet". Utilisé pour retrouver dans les messages de commit des
-// mentions de branches (notamment des fusions), y compris pour des branches
-// depuis supprimées.
-func (r *execRepository) LogSubjects(ref string) (string, error) {
-	return r.run("log", ref, "--date=iso8601", "--pretty=format:%h|%ad|%s")
+// MergeSubjects renvoie, pour chaque commit de fusion atteignable depuis ref,
+// une ligne "hash|date|sujet". Utilisé pour retrouver dans les messages de
+// fusion la branche intégrée, y compris pour des branches depuis supprimées.
+// Les commits ordinaires sont exclus : une branche simplement citée dans un
+// message ne doit pas passer pour une fusion.
+func (r *execRepository) MergeSubjects(ref string) (string, error) {
+	return r.run("log", ref, "--merges", "--date=iso8601", "--pretty=format:%h|%ad|%s")
 }
 
 // FirstParentHashes renvoie, du plus récent (ref lui-même) au plus ancien,

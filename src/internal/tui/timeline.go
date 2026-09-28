@@ -2,7 +2,6 @@ package tui
 
 import (
 	"fmt"
-	"regexp"
 	"sort"
 	"strings"
 
@@ -25,12 +24,6 @@ const laneLabelWidth = 11
 // maxCommitsShown limite le nombre de commits listés sous chaque fusion.
 const maxCommitsShown = 4
 
-// branchMentionRe repère une mention de branche feature/release/hotfix dans
-// un message de commit (message de fusion standard de git, ou mention dans
-// un message de merge de pull request), pour retrouver une fusion même si la
-// branche source a depuis été supprimée localement.
-var branchMentionRe = regexp.MustCompile(`\b(?:feature|release|hotfix)/[A-Za-z0-9._-]+`)
-
 // mergeRef décrit une fusion connue vers une cible : le commit de fusion
 // (hash interne + date) quand il a pu être identifié dans l'historique, ou
 // seulement la cible si on sait seulement que la branche y est intégrée
@@ -43,6 +36,54 @@ type mergeRef struct {
 	hash   string
 }
 
+// mergeIndex recense, pour chaque branche permanente (cible), les fusions de
+// branches éphémères trouvées dans son historique : cible → branche source
+// → fusions, de la plus récente à la plus ancienne. Une branche peut avoir
+// été fusionnée plusieurs fois (travail repris après une première fusion).
+type mergeIndex map[string]map[string][]mergeRef
+
+// latest renvoie la fusion la plus récente de name trouvée dans target.
+func (idx mergeIndex) latest(target, name string) (mergeRef, bool) {
+	events := idx[target][name]
+	if len(events) == 0 {
+		return mergeRef{}, false
+	}
+	return events[0], true
+}
+
+// unexpected renvoie, pour chaque cible non prévue par GitFlow pour node, la
+// fusion la plus récente de node trouvée dans son historique qui ne soit pas
+// un simple écho d'une fusion vers une cible valide — même commit, devenu
+// atteignable depuis main parce que main a ensuite intégré develop ou une
+// release. Toutes les fusions vers les cibles valides sont prises en compte
+// (pas seulement la plus récente) : une feature fusionnée deux fois dans
+// develop, dont seule la première fusion a déjà atteint main, n'est pas une
+// anomalie.
+func (idx mergeIndex) unexpected(node gitflow.Node) []mergeRef {
+	valid := make(map[string]bool, len(node.MergeTargets))
+	expected := make(map[string]bool)
+	for _, target := range node.MergeTargets {
+		valid[target] = true
+		for _, ev := range idx[target][node.Name] {
+			expected[ev.hash] = true
+		}
+	}
+	var out []mergeRef
+	for target, byName := range idx {
+		if valid[target] {
+			continue
+		}
+		for _, ev := range byName[node.Name] {
+			if !expected[ev.hash] {
+				out = append(out, ev)
+				break
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].date < out[j].date })
+	return out
+}
+
 // nearestMatch renvoie la position, dans chain (une chaîne "premier parent"
 // classée du plus récent au plus ancien), du premier commit appartenant à
 // set — ou -1 si aucun ne correspond.
@@ -53,22 +94,6 @@ func nearestMatch(chain []string, set map[string]bool) int {
 		}
 	}
 	return -1
-}
-
-// isEcho signale que ev correspond en réalité à l'une des fusions de refs
-// (même commit), et n'est donc pas une fusion distincte — utilisé pour ne
-// pas confondre une intégration transitive (ex. main a intégré develop, qui
-// contenait déjà la feature) avec une vraie fusion directe hors GitFlow.
-func isEcho(ev mergeRef, refs []mergeRef) bool {
-	if ev.hash == "" {
-		return false
-	}
-	for _, r := range refs {
-		if r.hash == ev.hash {
-			return true
-		}
-	}
-	return false
 }
 
 type laneKind int
@@ -104,53 +129,59 @@ type timeline struct {
 	lanes         []timelineLane
 }
 
-// scanMergeEvents parcourt l'historique atteignable depuis ref à la
-// recherche de mentions de branches feature/release/hotfix dans les sujets
-// de commit, et renvoie la première fusion trouvée pour chaque branche
-// mentionnée.
-func scanMergeEvents(repo git.Repository, ref string) map[string]mergeRef {
-	events := make(map[string]mergeRef)
-	out, err := repo.LogSubjects(ref)
-	if err != nil {
-		return events
+// foundMerge associe une fusion lue dans un message de commit au commit
+// qui la porte.
+type foundMerge struct {
+	merge gitflow.Merge
+	ref   mergeRef
+}
+
+// scanMerges parcourt les commits de fusion atteignables depuis ref et
+// renvoie ceux dont le message désigne une branche source reconnue par
+// keep, du plus récent au plus ancien.
+func scanMerges(repo git.Repository, ref string, keep func(gitflow.Merge) bool) []foundMerge {
+	var out []foundMerge
+	subjects, err := repo.MergeSubjects(ref)
+	if err != nil || subjects == "" {
+		return out
 	}
-	for _, line := range strings.Split(out, "\n") {
+	for _, line := range strings.Split(subjects, "\n") {
 		parts := strings.SplitN(line, "|", 3)
 		if len(parts) != 3 {
 			continue
 		}
-		hash, date, subject := parts[0], parts[1], parts[2]
-		name := branchMentionRe.FindString(subject)
-		if name == "" {
+		merge, ok := gitflow.ParseMerge(parts[2])
+		if !ok || merge.IsPull() || !keep(merge) {
 			continue
 		}
-		if _, exists := events[name]; !exists {
-			events[name] = mergeRef{target: ref, date: date, hash: hash}
-		}
+		out = append(out, foundMerge{merge: merge, ref: mergeRef{target: ref, date: parts[1], hash: parts[0]}})
+	}
+	return out
+}
+
+// scanMergeEvents recense les fusions de branches feature/release/hotfix
+// atteignables depuis ref, groupées par branche source.
+func scanMergeEvents(repo git.Repository, classifier gitflow.Classifier, ref string) map[string][]mergeRef {
+	events := make(map[string][]mergeRef)
+	ephemeral := func(m gitflow.Merge) bool { return classifier.ClassifyOne(m.Source).Type.IsEphemeral() }
+	for _, found := range scanMerges(repo, ref, ephemeral) {
+		events[found.merge.Source] = append(events[found.merge.Source], found.ref)
 	}
 	return events
 }
 
-// scanSyncEvents parcourt l'historique de mainRef à la recherche de commits
-// de fusion de developName (avec ou sans suffixe "into <cible>"), pour
-// retrouver chaque passage de develop vers main.
+// scanSyncEvents parcourt l'historique de mainRef à la recherche des
+// fusions de developName dans mainRef (message git standard, ou merge de
+// pull request), pour retrouver chaque passage de develop vers main. Les
+// fusions de develop vers une autre branche (ex. une feature mise à jour
+// depuis develop), également atteignables depuis main, sont écartées.
 func scanSyncEvents(repo git.Repository, mainRef, developName string) []mergeRef {
-	out, err := repo.LogSubjects(mainRef)
-	if err != nil {
-		return nil
+	sync := func(m gitflow.Merge) bool {
+		return m.Source == developName && (m.Target == "" || m.Target == mainRef)
 	}
-	prefix := "Merge branch '" + developName + "'"
-	remotePrefix := "Merge remote-tracking branch 'origin/" + developName + "'"
 	var events []mergeRef
-	for _, line := range strings.Split(out, "\n") {
-		parts := strings.SplitN(line, "|", 3)
-		if len(parts) != 3 {
-			continue
-		}
-		hash, date, subject := parts[0], parts[1], parts[2]
-		if strings.HasPrefix(subject, prefix) || strings.HasPrefix(subject, remotePrefix) {
-			events = append(events, mergeRef{target: mainRef, date: date, hash: hash})
-		}
+	for _, found := range scanMerges(repo, mainRef, sync) {
+		events = append(events, found.ref)
 	}
 	return events
 }
@@ -160,7 +191,7 @@ func scanSyncEvents(repo git.Repository, mainRef, developName string) []mergeRef
 // synchronisation develop → main) se voit attribuer une colonne unique
 // d'après sa date, utilisée à la fois pour son propre repère et pour le
 // repère correspondant sur la ou les lignes concernées.
-func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]git.Branch) timeline {
+func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []gitflow.Node, byName map[string]git.Branch) timeline {
 	var tl timeline
 	var ephemeral []gitflow.Node
 
@@ -177,11 +208,11 @@ func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]
 		}
 	}
 
-	mergesByTarget := make(map[string]map[string]mergeRef, 2)
+	mergesByTarget := make(mergeIndex, 2)
 	mainSpine := map[string]bool{}
 	developSpine := map[string]bool{}
 	if tl.main != nil {
-		mergesByTarget[tl.main.node.Name] = scanMergeEvents(repo, tl.main.node.Name)
+		mergesByTarget[tl.main.node.Name] = scanMergeEvents(repo, classifier, tl.main.node.Name)
 		if commits, err := repo.DirectCommits(tl.main.node.Name); err == nil {
 			tl.mainDirect = commits
 		}
@@ -192,7 +223,7 @@ func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]
 		}
 	}
 	if tl.develop != nil {
-		mergesByTarget[tl.develop.node.Name] = scanMergeEvents(repo, tl.develop.node.Name)
+		mergesByTarget[tl.develop.node.Name] = scanMergeEvents(repo, classifier, tl.develop.node.Name)
 		if commits, err := repo.DirectCommits(tl.develop.node.Name); err == nil {
 			tl.developDirect = commits
 		}
@@ -209,6 +240,7 @@ func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]
 		kind        laneKind
 		refs        []mergeRef // pré-calculées pour laneDeleted et laneSync
 		anomalies   []mergeRef // pré-calculées pour laneDeleted
+		pending     []string   // pré-calculées pour laneDeleted : cibles jamais atteintes
 		wrongParent string     // renseigné si le point de divergence appartient en fait à l'autre ligne principale
 	}
 
@@ -277,40 +309,27 @@ func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]
 		}
 		seen[name] = true
 
-		node := gitflow.Classify([]string{name})[0]
-		validSet := make(map[string]bool, len(node.MergeTargets))
-		for _, t := range node.MergeTargets {
-			validSet[t] = true
-		}
+		node := classifier.ClassifyOne(name)
 
 		// On ne retient comme fusion "normale" que les cibles réellement
 		// valides pour ce type de branche (ex. develop pour une feature).
 		var refs []mergeRef
 		for _, target := range node.MergeTargets {
-			if ev, ok := mergesByTarget[target][name]; ok {
+			if ev, ok := mergesByTarget.latest(target, name); ok {
 				refs = append(refs, ev)
 			}
 		}
 
-		// Une mention trouvée dans une cible non valide (ex. main pour une
-		// feature) est soit un écho transitif (le commit est déjà compté
-		// via refs — main a ensuite intégré develop), soit une vraie
+		// Une fusion trouvée dans une cible non valide (ex. main pour une
+		// feature) est soit un écho transitif (même commit que l'une des
+		// fusions valides — main a ensuite intégré develop), soit une vraie
 		// anomalie : une fusion directe hors du flow attendu.
-		var anomalies []mergeRef
-		for target, events := range mergesByTarget {
-			if validSet[target] {
-				continue
-			}
-			if ev, ok := events[name]; ok && !isEcho(ev, refs) {
-				anomalies = append(anomalies, ev)
-			}
-		}
+		anomalies := mergesByTarget.unexpected(node)
 
 		if len(refs) == 0 && len(anomalies) == 0 {
 			continue
 		}
 		sort.Slice(refs, func(i, j int) bool { return refs[i].date < refs[j].date })
-		sort.Slice(anomalies, func(i, j int) bool { return anomalies[i].date < anomalies[j].date })
 
 		date := ""
 		if len(refs) > 0 {
@@ -320,7 +339,31 @@ func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]
 			date = anomalies[0].date
 		}
 
-		candidates = append(candidates, candidate{node: node, date: date, kind: laneDeleted, refs: refs, anomalies: anomalies})
+		// Une cible valide sans fusion identifiée peut malgré tout contenir
+		// le travail de la branche, arrivé par un autre chemin (hotfix
+		// fusionné dans la release en cours, qui a ensuite rejoint
+		// develop) : le second parent d'une fusion connue est la pointe de
+		// la branche supprimée, il suffit de vérifier que la cible la
+		// contient. Sinon la cible n'a jamais été atteinte.
+		var tip string
+		if len(refs) > 0 {
+			tip = refs[0].hash + "^2"
+		} else {
+			tip = anomalies[0].hash + "^2"
+		}
+		var pending []string
+		for _, target := range node.MergeTargets {
+			if _, ok := mergesByTarget.latest(target, name); ok {
+				continue
+			}
+			if merged, err := repo.IsAncestor(tip, target); err == nil && merged {
+				refs = append(refs, mergeRef{target: target})
+				continue
+			}
+			pending = append(pending, target)
+		}
+
+		candidates = append(candidates, candidate{node: node, date: date, kind: laneDeleted, refs: refs, anomalies: anomalies, pending: pending})
 	}
 
 	if tl.main != nil && tl.develop != nil {
@@ -342,11 +385,16 @@ func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]
 		case laneDeleted, laneSync:
 			lane.merged = c.refs
 			lane.anomalies = c.anomalies
+			lane.pending = c.pending
+			// Une cible atteinte sans commit de fusion identifié (cf.
+			// IsAncestor) n'a pas de hash : prendre la première fusion
+			// réellement identifiée.
 			hash := ""
-			if len(c.refs) > 0 {
-				hash = c.refs[0].hash
-			} else if len(c.anomalies) > 0 {
-				hash = c.anomalies[0].hash
+			for _, mr := range append(append([]mergeRef{}, c.refs...), c.anomalies...) {
+				if mr.hash != "" {
+					hash = mr.hash
+					break
+				}
 			}
 			if hash != "" {
 				if commits, err := repo.MergeCommits(hash); err == nil {
@@ -356,10 +404,8 @@ func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]
 		default:
 			lane.branch = byName[c.node.Name]
 			lane.wrongParent = c.wrongParent
-			validSet := make(map[string]bool, len(c.node.MergeTargets))
 			for _, target := range c.node.MergeTargets {
-				validSet[target] = true
-				if ev, ok := mergesByTarget[target][c.node.Name]; ok {
+				if ev, ok := mergesByTarget.latest(target, c.node.Name); ok {
 					lane.merged = append(lane.merged, ev)
 				} else if merged, err := repo.IsAncestor(c.node.Name, target); err == nil && merged {
 					lane.merged = append(lane.merged, mergeRef{target: target})
@@ -367,14 +413,7 @@ func buildTimeline(repo git.Repository, nodes []gitflow.Node, byName map[string]
 					lane.pending = append(lane.pending, target)
 				}
 			}
-			for target, events := range mergesByTarget {
-				if validSet[target] {
-					continue
-				}
-				if ev, ok := events[c.node.Name]; ok && !isEcho(ev, lane.merged) {
-					lane.anomalies = append(lane.anomalies, ev)
-				}
-			}
+			lane.anomalies = mergesByTarget.unexpected(c.node)
 			if commits, err := repo.CommitsNotIn(c.node.Name, c.node.Parent); err == nil {
 				lane.commits = commits
 			}
@@ -479,10 +518,11 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 	}
 
 	var b strings.Builder
-	writeGroup := func(label string, color lipgloss.Color, spine *timelineLane, direct []git.Commit, group []timelineLane) {
+	writeGroup := func(color lipgloss.Color, spine *timelineLane, direct []git.Commit, group []timelineLane) {
 		if spine == nil {
 			return
 		}
+		label := spine.node.Name
 		b.WriteString(renderSpine(label, color, *spine, spineLen, tl.lanes))
 		b.WriteString("\n")
 		if block := renderDirectCommits(label, direct); block != "" {
@@ -497,8 +537,8 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 		b.WriteString("\n")
 	}
 
-	writeGroup("main", colorMain, tl.main, tl.mainDirect, mainLanes)
-	writeGroup("develop", colorDevelop, tl.develop, tl.developDirect, developLanes)
+	writeGroup(colorMain, tl.main, tl.mainDirect, mainLanes)
+	writeGroup(colorDevelop, tl.develop, tl.developDirect, developLanes)
 
 	if len(tl.lanes) == 0 && len(tl.mainDirect) == 0 && len(tl.developDirect) == 0 {
 		b.WriteString(styleFaint.Render(emptyMsg))
@@ -651,8 +691,14 @@ func renderLane(l timelineLane) string {
 			parts = append(parts, mr.target)
 		}
 	}
+	// Une branche supprimée ne sera plus fusionnée : sa cible manquante
+	// n'est pas "en attente" mais définitivement ratée.
+	pendingLabel := " (en attente)"
+	if l.kind == laneDeleted {
+		pendingLabel = " (jamais fusionnée)"
+	}
 	for _, t := range l.pending {
-		parts = append(parts, warnStyle.Render(t+" (en attente)"))
+		parts = append(parts, warnStyle.Render(t+pendingLabel))
 	}
 	targetTxt := "—"
 	if len(parts) > 0 {
@@ -661,8 +707,12 @@ func renderLane(l timelineLane) string {
 
 	var status string
 	switch {
-	case l.kind == laneDeleted:
+	case l.kind == laneDeleted && len(l.pending) == 0:
 		status = "✔ fusionnée (supprimée)"
+	case l.kind == laneDeleted && len(l.merged) > 0:
+		status = warnStyle.Render("⚠ partiellement fusionnée (supprimée)")
+	case l.kind == laneDeleted:
+		status = "× supprimée"
 	case l.kind == laneSync:
 		status = warnStyle.Render("⚠ fusion directe (hors GitFlow)")
 	case len(l.pending) == 0 && len(l.merged) > 0:

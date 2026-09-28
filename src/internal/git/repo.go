@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -27,7 +28,7 @@ type Repository interface {
 	AheadBehind(base, branch string) (ahead, behind int, err error)
 	CommitsNotIn(branch, base string) ([]Commit, error)
 	MergeCommits(mergeHash string) ([]Commit, error)
-	LogSubjects(ref string) (string, error)
+	MergeSubjects(ref string) (string, error)
 	DirectCommits(ref string) ([]Commit, error)
 	FirstParentHashes(ref string) ([]string, error)
 	FirstParentCommits(ref string) ([]Commit, error)
@@ -47,7 +48,11 @@ type Repository interface {
 
 type execRepository struct {
 	dir    string // racine du dépôt (working tree)
-	gitDir string // répertoire .git réel, résolu une fois (cf. worktrees)
+	gitDir string // répertoire .git propre au working tree (HEAD), résolu une fois
+	// commonDir est le répertoire .git partagé par tous les worktrees, qui
+	// contient les refs. Identique à gitDir hors worktree ; pour un worktree
+	// lié, gitDir vaut .git/worktrees/<nom>, qui n'a pas de refs/heads.
+	commonDir string
 }
 
 // Open détecte le dépôt git contenant dir (racine du dépôt) et renvoie un
@@ -65,12 +70,23 @@ func Open(dir string) (Repository, error) {
 	if err != nil {
 		return nil, ErrNotARepo
 	}
-	if !filepath.IsAbs(gitDir) {
-		gitDir = filepath.Join(repo.dir, gitDir)
+	repo.gitDir = repo.absPath(gitDir)
+
+	repo.commonDir = repo.gitDir
+	if commonDir, err := repo.run("rev-parse", "--git-common-dir"); err == nil {
+		repo.commonDir = repo.absPath(commonDir)
 	}
-	repo.gitDir = gitDir
 
 	return repo, nil
+}
+
+// absPath résout un chemin renvoyé par git rev-parse, relatif à la racine
+// du dépôt (répertoire depuis lequel git est lancé).
+func (r *execRepository) absPath(path string) string {
+	if filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Join(r.dir, path)
 }
 
 func (r *execRepository) run(args ...string) (string, error) {
@@ -112,11 +128,14 @@ func (r *execRepository) IsAncestor(ancestor, descendant string) (bool, error) {
 	return false, fmt.Errorf("git merge-base --is-ancestor %s %s: %w", ancestor, descendant, err)
 }
 
-// StateFingerprint lit HEAD, packed-refs et l'arborescence refs/heads
+// StateFingerprint lit HEAD, packed-refs et les arborescences de refs
 // directement sur disque (aucun processus git lancé) et en combine une
 // empreinte : n'importe quel commit, fusion, changement de branche, ou
 // création/suppression de branche modifie l'un de ces fichiers et fait donc
-// varier la valeur renvoyée.
+// varier la valeur renvoyée. HEAD est propre au worktree, les refs sont
+// partagées (commonDir) ; le répertoire reftable couvre les dépôts qui
+// utilisent ce format de stockage des refs (git 2.45+) à la place de
+// refs/heads et packed-refs.
 func (r *execRepository) StateFingerprint() string {
 	h := fnv.New64a()
 
@@ -124,13 +143,22 @@ func (r *execRepository) StateFingerprint() string {
 		h.Write(head)
 	}
 
-	if info, err := os.Stat(filepath.Join(r.gitDir, "packed-refs")); err == nil {
+	if info, err := os.Stat(filepath.Join(r.commonDir, "packed-refs")); err == nil {
 		fmt.Fprintf(h, "packed-refs:%d:%d", info.Size(), info.ModTime().UnixNano())
 	}
 
-	refsHeads := filepath.Join(r.gitDir, "refs", "heads")
+	writeTreeFingerprint(h, filepath.Join(r.commonDir, "refs", "heads"))
+	writeTreeFingerprint(h, filepath.Join(r.commonDir, "reftable"))
+
+	return fmt.Sprintf("%x", h.Sum64())
+}
+
+// writeTreeFingerprint ajoute à w le chemin relatif, la taille et la date de
+// modification de chaque fichier sous root, dans un ordre stable. Un
+// répertoire absent n'ajoute rien.
+func writeTreeFingerprint(w io.Writer, root string) {
 	var entries []string
-	_ = filepath.WalkDir(refsHeads, func(path string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}
@@ -138,7 +166,7 @@ func (r *execRepository) StateFingerprint() string {
 		if err != nil {
 			return nil
 		}
-		rel, err := filepath.Rel(refsHeads, path)
+		rel, err := filepath.Rel(root, path)
 		if err != nil {
 			rel = path
 		}
@@ -147,10 +175,8 @@ func (r *execRepository) StateFingerprint() string {
 	})
 	sort.Strings(entries)
 	for _, e := range entries {
-		h.Write([]byte(e))
+		io.WriteString(w, e)
 	}
-
-	return fmt.Sprintf("%x", h.Sum64())
 }
 
 func atoiSafe(s string) int {

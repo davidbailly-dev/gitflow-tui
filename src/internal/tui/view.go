@@ -23,7 +23,7 @@ func (m Model) View() string {
 	footer := m.renderFooter()
 
 	if m.showHelp {
-		return lipgloss.JoinVertical(lipgloss.Left, header, m.renderHelp(), footer)
+		return m.padToHeight(lipgloss.JoinVertical(lipgloss.Left, header, m.renderHelp(), footer))
 	}
 
 	var body string
@@ -77,6 +77,9 @@ func (m Model) renderHeader() string {
 		}
 	}
 	title := fmt.Sprintf("gitflow-tui — vue: %s", viewName)
+	if m.refreshing {
+		title += "  ⟳ rafraîchissement…"
+	}
 	return style.Width(maxInt(m.width, 0)).Render(title)
 }
 
@@ -249,21 +252,20 @@ func renderCommitLine(c git.Commit, selected bool) string {
 	return style.Render(fmt.Sprintf("%s %s %s — %s", marker, c.Hash, shortDate(c.Date), c.Subject))
 }
 
-// mentionedBranch cherche une mention de branche feature/release/hotfix
-// dans subject (message d'un commit de fusion) et renvoie son nom classifié
-// GitFlow, pour afficher la branche source d'une fusion plutôt que sa seule
-// cible.
-func mentionedBranch(subject string) (name string, branchType gitflow.BranchType, ok bool) {
-	name = branchMentionRe.FindString(subject)
-	if name == "" {
+// mergedBranch renvoie la branche source d'un commit de fusion, lue dans
+// son message, et son type GitFlow, pour afficher la branche intégrée par
+// une fusion plutôt que sa seule cible.
+func mergedBranch(subject string) (name string, branchType gitflow.BranchType, ok bool) {
+	merge, ok := gitflow.ParseMerge(subject)
+	if !ok {
 		return "", 0, false
 	}
-	return name, gitflow.Classify([]string{name})[0].Type, true
+	return merge.Source, gitflow.Classify([]string{merge.Source})[0].Type, true
 }
 
 // renderDiffPane dessine le panneau "contenu". Son en-tête rappelle la
 // branche concernée, colorée selon son type GitFlow : la branche source
-// d'une fusion (ex. feature/x, mentionnée dans le message) si elle est
+// d'une fusion (ex. feature/x, lue dans le message) si elle est
 // identifiable, sinon celle sélectionnée au panneau 1 — sans quoi on la
 // perd de vue dès que le focus en sort.
 func (m Model) renderDiffPane(width int) string {
@@ -273,7 +275,7 @@ func (m Model) renderDiffPane(width int) string {
 
 	var branchLabel string
 	if hasCommit && c.IsMerge {
-		if name, branchType, found := mentionedBranch(c.Subject); found {
+		if name, branchType, found := mergedBranch(c.Subject); found {
 			branchLabel = lipgloss.NewStyle().Bold(true).Foreground(colorFor(branchType)).Render(name)
 		}
 	}

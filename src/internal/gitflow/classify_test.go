@@ -1,6 +1,9 @@
 package gitflow
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func TestClassify(t *testing.T) {
 	cases := []struct {
@@ -31,5 +34,35 @@ func TestClassify(t *testing.T) {
 				t.Errorf("parent = %q, attendu %q", got.Parent, c.wantParent)
 			}
 		})
+	}
+}
+
+func TestClassifierMaster(t *testing.T) {
+	c := NewClassifier([]string{"master", "develop", "hotfix/1.0.1"})
+	if c.Main != "master" {
+		t.Fatalf("Main = %q, attendu master", c.Main)
+	}
+
+	hotfix := c.ClassifyOne("hotfix/1.0.1")
+	if hotfix.Parent != "master" {
+		t.Errorf("parent du hotfix = %q, attendu master", hotfix.Parent)
+	}
+	if want := []string{"master", "develop"}; !reflect.DeepEqual(hotfix.MergeTargets, want) {
+		t.Errorf("cibles du hotfix = %v, attendu %v", hotfix.MergeTargets, want)
+	}
+
+	release := c.ClassifyOne("release/1.0.0")
+	if want := []string{"develop", "master"}; !reflect.DeepEqual(release.MergeTargets, want) {
+		t.Errorf("cibles de la release = %v, attendu %v", release.MergeTargets, want)
+	}
+}
+
+func TestClassifierMainAndMaster(t *testing.T) {
+	c := NewClassifier([]string{"master", "main", "develop"})
+	if c.Main != "main" {
+		t.Fatalf("Main = %q, attendu main", c.Main)
+	}
+	if got := c.ClassifyOne("master").Type; got != TypeOther {
+		t.Errorf("type de master = %v, attendu TypeOther", got)
 	}
 }
