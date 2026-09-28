@@ -8,7 +8,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"gitflow-tui/internal/git"
+	"gitflow-tui/internal/gitflow"
 )
 
 // tabWidth est le nombre d'espaces qui remplacent une tabulation du diff :
@@ -25,7 +25,7 @@ const tabWidth = 4
 // chaque morceau d'une ligne repliée reçoit ainsi la couleur de sa ligne
 // d'origine, alors que le retour à la ligne automatique du viewport la
 // perdrait sur la partie repliée.
-func renderDiff(merged []git.Commit, show string, width int) string {
+func renderDiff(merged []gitflow.Commit, show string, width int) string {
 	width = maxInt(width, 1)
 	var out []string
 
@@ -33,7 +33,7 @@ func renderDiff(merged []git.Commit, show string, width int) string {
 		header := lipgloss.NewStyle().Foreground(colorMerge).Bold(true)
 		out = append(out, header.Render(ansi.Truncate(fmt.Sprintf("⑂ %d commit(s) apporté(s) par cette fusion :", len(merged)), width, "…")))
 		for _, c := range merged {
-			out = append(out, ansi.Truncate(fmt.Sprintf("· %s %s", c.Hash, c.Subject), width, "…"))
+			out = append(out, ansi.Truncate(fmt.Sprintf("· %s %s", c.Short(), c.Subject), width, "…"))
 		}
 		out = append(out, "")
 	}

@@ -9,7 +9,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
-	"gitflow-tui/internal/git"
 	"gitflow-tui/internal/gitflow"
 )
 
@@ -83,8 +82,8 @@ func (m Model) renderHeader() string {
 	}
 
 	branch := "HEAD détachée"
-	if m.currentBranch != "" {
-		branch = "● " + m.currentBranch
+	if m.report.CurrentBranch != "" {
+		branch = "● " + m.report.CurrentBranch
 	}
 	repoName := filepath.Base(m.repo.Root())
 	if remote := m.repo.Remote(); remote != "" {
@@ -303,12 +302,12 @@ func (m Model) renderCommitPane(width int) string {
 	switch {
 	case !ok:
 		lines = []string{styleFaint.Render("Aucune branche sélectionnée.")}
-	case len(it.commits) == 0:
-		header = styleColumnTitle.Render(it.node.Name)
+	case len(it.Commits) == 0:
+		header = styleColumnTitle.Render(it.Node.Name)
 		lines = []string{styleFaint.Render("(aucun commit)")}
 	default:
-		header = styleColumnTitle.Render(it.node.Name)
-		for i, c := range it.commits {
+		header = styleColumnTitle.Render(it.Node.Name)
+		for i, c := range it.Commits {
 			lines = append(lines, renderCommitLine(c, i == m.commitIdx, m.paneFocus == paneCommits))
 		}
 	}
@@ -326,17 +325,17 @@ func (m Model) renderCommitPane(width int) string {
 // renderCommitLine dessine un commit de la liste : hash et date atténués,
 // sujet en clair, ou en couleur de fusion (avec "⑂") pour un commit de
 // fusion. La ligne sélectionnée est surlignée d'un seul tenant.
-func renderCommitLine(c git.Commit, selected, focused bool) string {
+func renderCommitLine(c gitflow.Commit, selected, focused bool) string {
 	marker := " "
 	subject := lipgloss.NewStyle()
-	if c.IsMerge {
+	if c.IsMerge() {
 		marker = "⑂"
 		subject = subject.Foreground(colorMerge)
 	}
 	if selected {
-		return selectionStyle(subject, focused).Render(fmt.Sprintf("%s %s %s — %s", marker, c.Hash, shortDate(c.Date), c.Subject))
+		return selectionStyle(subject, focused).Render(fmt.Sprintf("%s %s %s — %s", marker, c.Short(), c.AuthorDate, c.Subject))
 	}
-	meta := styleFaint.Render(fmt.Sprintf("%s %s —", c.Hash, shortDate(c.Date)))
+	meta := styleFaint.Render(fmt.Sprintf("%s %s —", c.Short(), c.AuthorDate))
 	return subject.Render(marker) + " " + meta + " " + subject.Render(c.Subject)
 }
 
@@ -348,7 +347,7 @@ func (m Model) mergedBranch(subject string) (name string, branchType gitflow.Bra
 	if !ok {
 		return "", 0, false
 	}
-	return merge.Source, m.classifier.ClassifyOne(merge.Source).Type, true
+	return merge.Source, m.report.Classifier.ClassifyOne(merge.Source).Type, true
 }
 
 // renderDiffPane dessine le panneau "contenu". Son en-tête rappelle la
@@ -362,20 +361,20 @@ func (m Model) renderDiffPane(width int) string {
 	c, hasCommit := m.selectedCommit()
 
 	var branchLabel string
-	if hasCommit && c.IsMerge {
+	if hasCommit && c.IsMerge() {
 		if name, branchType, found := m.mergedBranch(c.Subject); found {
 			branchLabel = lipgloss.NewStyle().Bold(true).Foreground(colorFor(branchType)).Render(name)
 		}
 	}
 	if branchLabel == "" {
 		if it, ok := m.selectedBranchRow(); ok {
-			branchLabel = lipgloss.NewStyle().Bold(true).Foreground(colorFor(it.node.Type)).Render(it.node.Name)
+			branchLabel = lipgloss.NewStyle().Bold(true).Foreground(colorFor(it.Node.Type)).Render(it.Node.Name)
 		}
 	}
 
 	title := "Contenu"
 	if hasCommit {
-		title = fmt.Sprintf("%s — %s", c.Hash, c.Subject)
+		title = fmt.Sprintf("%s — %s", c.Short(), c.Subject)
 	}
 
 	sep := ""
@@ -395,37 +394,37 @@ func (m Model) renderDiffPane(width int) string {
 // de son type : "✔" si elle est fusionnée dans toutes ses cibles, "⚠" si
 // seulement dans certaines, sinon son avance (↑) et son retard (↓) sur sa
 // branche parente, zéros omis.
-func renderItemLine(it item, selected, focused bool) string {
+func renderItemLine(it gitflow.BranchState, selected, focused bool) string {
 	marker := " "
-	if it.branch.IsHead {
+	if it.Branch.IsHead {
 		marker = "●"
 	}
-	style := lipgloss.NewStyle().Foreground(colorFor(it.node.Type))
-	if it.branch.IsHead {
+	style := lipgloss.NewStyle().Foreground(colorFor(it.Node.Type))
+	if it.Branch.IsHead {
 		style = style.Bold(true)
 	}
 
 	var status string
 	statusStyle := styleFaint
-	switch it.status {
-	case statusMerged:
+	switch it.Status {
+	case gitflow.StatusMerged:
 		status = "✔"
-	case statusPartial:
+	case gitflow.StatusPartial:
 		status = "⚠"
 		statusStyle = lipgloss.NewStyle().Foreground(colorWarning)
 	default:
 		var parts []string
-		if it.ahead > 0 {
-			parts = append(parts, fmt.Sprintf("↑%d", it.ahead))
+		if it.Ahead > 0 {
+			parts = append(parts, fmt.Sprintf("↑%d", it.Ahead))
 		}
-		if it.behind > 0 {
-			parts = append(parts, fmt.Sprintf("↓%d", it.behind))
+		if it.Behind > 0 {
+			parts = append(parts, fmt.Sprintf("↓%d", it.Behind))
 		}
 		status = strings.Join(parts, " ")
 	}
 
-	if it.staleDays > 0 {
-		stale := fmt.Sprintf("◷%dj", it.staleDays)
+	if it.StaleDays > 0 {
+		stale := fmt.Sprintf("◷%dj", it.StaleDays)
 		if status == "" {
 			status = stale
 		} else {
@@ -434,7 +433,7 @@ func renderItemLine(it item, selected, focused bool) string {
 		statusStyle = lipgloss.NewStyle().Foreground(colorWarning)
 	}
 
-	text := marker + " " + it.node.Name
+	text := marker + " " + it.Node.Name
 	if selected {
 		if status != "" {
 			text += " " + status

@@ -4,7 +4,6 @@
 package tui
 
 import (
-	"sort"
 	"strings"
 	"time"
 
@@ -13,7 +12,6 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
-	"gitflow-tui/internal/git"
 	"gitflow-tui/internal/gitflow"
 )
 
@@ -54,44 +52,29 @@ const (
 	paneDiff
 )
 
-// graphMode sélectionne ce que montre la vue graphe : l'historique complet
-// (branches supprimées reconstituées, synchronisations minées, alertes
-// détectées en scannant tout le log), ou seulement l'état courant du dépôt
-// (branches locales encore en attente d'une fusion).
-type graphMode int
-
-const (
-	graphHistory graphMode = iota
-	graphLive
-)
-
-// mergeStatus résume où en est l'intégration d'une branche éphémère dans
-// ses cibles GitFlow, tel que le calcule le graphe.
-type mergeStatus int
-
-const (
-	statusPending mergeStatus = iota // aucune cible atteinte (ou branche permanente)
-	statusMerged                     // toutes les cibles atteintes
-	statusPartial                    // certaines cibles atteintes, pas toutes
-)
-
-// item est une branche prête à être affichée : sa classification GitFlow,
-// ses données git, et son statut par rapport à sa branche parente.
-type item struct {
-	node   gitflow.Node
-	branch git.Branch
-	ahead  int
-	behind int
-	status mergeStatus
-	// staleDays est le nombre de jours sans commit d'une branche jugée
-	// inactive (cf. Options.StaleAfter), 0 sinon.
-	staleDays int
-	commits   []git.Commit
+// Repository est ce dont l'interface a besoin du dépôt : son historique, à
+// analyser, et de quoi afficher un commit et surveiller les changements.
+type Repository interface {
+	gitflow.History
+	// Root renvoie la racine du working tree.
+	Root() string
+	// Remote renvoie le remote dont les branches sont analysées, vide pour
+	// les branches locales.
+	Remote() string
+	// Show renvoie le contenu complet d'un commit (git show), statistiques
+	// calibrées pour width colonnes.
+	Show(hash string, width int) (string, error)
+	// StateFingerprint renvoie une empreinte bon marché de l'état des refs,
+	// obtenue sans lancer git : un changement de valeur signale un commit,
+	// une fusion, un changement ou une suppression de branche.
+	StateFingerprint() string
 }
 
+// column est un groupe de branches du panneau de gauche de la vue
+// colonnes (un type GitFlow).
 type column struct {
 	title string
-	items []item
+	items []gitflow.BranchState
 }
 
 // branchRow est une ligne du panneau de gauche de la vue colonnes : soit un
@@ -100,7 +83,7 @@ type column struct {
 type branchRow struct {
 	header string
 	count  int
-	it     item
+	it     gitflow.BranchState
 }
 
 // dataLoadedMsg porte le résultat d'un chargement (initial, manuel via 'r',
@@ -109,12 +92,10 @@ type branchRow struct {
 // l'empreinte courante lors du tick suivant permet de rattraper tout
 // changement survenu pendant le chargement lui-même.
 type dataLoadedMsg struct {
-	columns       []column
-	timeline      timeline
-	classifier    gitflow.Classifier
-	currentBranch string
-	fingerprint   string
-	err           error
+	report      gitflow.Report
+	columns     []column
+	fingerprint string
+	err         error
 }
 
 // diffLoadedMsg porte le contenu (git show) du commit demandé et, pour une
@@ -122,18 +103,19 @@ type dataLoadedMsg struct {
 // devenu obsolète si la sélection a changé entre temps.
 type diffLoadedMsg struct {
 	hash   string
-	merged []git.Commit
+	merged []gitflow.Commit
 	show   string
 	err    error
 }
 
 // Model est le modèle racine Bubble Tea de gitflow-tui.
 type Model struct {
-	repo git.Repository
+	repo Repository
 	opts Options
-	// classifier est celui du dernier chargement : il porte les conventions
-	// GitFlow du dépôt (noms des branches permanentes, préfixes).
-	classifier gitflow.Classifier
+	// report est le résultat de la dernière analyse du dépôt ; son
+	// classifieur porte les conventions GitFlow du dépôt (noms des branches
+	// permanentes, préfixes).
+	report gitflow.Report
 
 	width, height int
 
@@ -159,8 +141,7 @@ type Model struct {
 	filter    string
 	filtering bool
 
-	timeline timeline
-	graph    viewport.Model
+	graph viewport.Model
 	// graphX est le décalage horizontal (en colonnes de caractères) de la
 	// vue graphe, dont les lignes dépassent souvent la largeur du terminal.
 	graphX int
@@ -173,13 +154,12 @@ type Model struct {
 	diffFor string
 	// diffMerged et diffShow gardent le contenu brut du commit affiché, pour
 	// le remettre en forme (retour à la ligne) quand la largeur change.
-	diffMerged []git.Commit
+	diffMerged []gitflow.Commit
 	diffShow   string
 
-	// currentBranch et loadedAt alimentent l'en-tête : branche courante
-	// (vide si HEAD est détachée) et heure du dernier chargement réussi.
-	currentBranch string
-	loadedAt      time.Time
+	// loadedAt est l'heure du dernier chargement réussi, affichée dans
+	// l'en-tête.
+	loadedAt time.Time
 
 	showHelp bool
 	loading  bool
@@ -194,7 +174,7 @@ type Model struct {
 }
 
 // New construit le modèle initial pour le dépôt donné.
-func New(repo git.Repository, opts Options) Model {
+func New(repo Repository, opts Options) Model {
 	return Model{
 		repo:              repo,
 		opts:              opts,
@@ -218,153 +198,62 @@ type Options struct {
 	StaleAfter time.Duration
 }
 
-func loadData(repo git.Repository, opts Options) tea.Cmd {
+// loadData analyse le dépôt en tâche de fond.
+func loadData(repo Repository, opts Options) tea.Cmd {
 	return func() tea.Msg {
 		fingerprint := repo.StateFingerprint()
-
-		branches, err := repo.Branches()
+		report, err := gitflow.Analyze(repo, gitflow.Options{StaleAfter: opts.StaleAfter, Now: time.Now()})
 		if err != nil {
 			return dataLoadedMsg{fingerprint: fingerprint, err: err}
 		}
-
-		names := make([]string, len(branches))
-		byName := make(map[string]git.Branch, len(branches))
-		for i, b := range branches {
-			names[i] = b.Name
-			byName[b.Name] = b
-		}
-
-		cfg := gitflow.DefaultConfig()
-		if values, err := repo.GitflowConfig(); err == nil {
-			cfg = gitflow.ConfigFromGit(values)
-		}
-		classifier := gitflow.NewClassifier(names, cfg)
-		nodes := classifier.Classify(names)
-		sort.Slice(nodes, func(i, j int) bool { return nodes[i].Name < nodes[j].Name })
-
-		var permanent []string
-		for _, name := range []string{classifier.Main, classifier.Develop} {
-			if _, ok := byName[name]; ok {
-				permanent = append(permanent, name)
-			}
-		}
-		sp := loadSpines(repo, permanent...)
-		_, hasMain := byName[classifier.Main]
-
-		// main et develop listent tout leur historique direct ; les autres
-		// branches, leurs seuls commits propres (partagés avec le graphe).
-		commitsByName := make(map[string][]git.Commit, len(nodes))
-		toItem := func(n gitflow.Node) item {
-			it := item{node: n, branch: byName[n.Name]}
-			switch {
-			case n.Parent != "":
-				if ahead, behind, err := repo.AheadBehind(n.Parent, n.Name); err == nil {
-					it.ahead, it.behind = ahead, behind
-				}
-			case n.Type == gitflow.TypeDevelop && hasMain:
-				// develop face à main : travail en attente de la prochaine
-				// release (↑), et correctifs de main pas encore redescendus
-				// dans develop (↓). Les commits de fusion ne comptent pas :
-				// chaque fusion de release dans main en crée un que develop
-				// n'a jamais.
-				it.ahead, _ = repo.CountNotIn(n.Name, classifier.Main)
-				it.behind, _ = repo.CountNotIn(classifier.Main, n.Name)
-			}
-			switch n.Type {
-			case gitflow.TypeMain, gitflow.TypeDevelop:
-				if commits, err := repo.FirstParentCommits(n.Name); err == nil {
-					it.commits = commits
-				}
-			default:
-				it.commits = ownCommits(repo, n, sp)
-			}
-			commitsByName[n.Name] = it.commits
-			return it
-		}
-
-		// Un groupe par type GitFlow, titré d'après les préfixes du dépôt ;
-		// main puis develop en tête, dans le groupe des permanentes.
-		groups := []struct {
-			title string
-			types []gitflow.BranchType
-		}{
-			{"permanentes", []gitflow.BranchType{gitflow.TypeMain, gitflow.TypeDevelop}},
-			{cfg.FeaturePrefix + "*", []gitflow.BranchType{gitflow.TypeFeature}},
-			{cfg.BugfixPrefix + "*", []gitflow.BranchType{gitflow.TypeBugfix}},
-			{cfg.ReleasePrefix + "*", []gitflow.BranchType{gitflow.TypeRelease}},
-			{cfg.HotfixPrefix + "*", []gitflow.BranchType{gitflow.TypeHotfix}},
-			{cfg.SupportPrefix + "*", []gitflow.BranchType{gitflow.TypeSupport}},
-			{"autre", []gitflow.BranchType{gitflow.TypeOther}},
-		}
-		cols := make([]column, 0, len(groups))
-		for _, g := range groups {
-			col := column{title: g.title}
-			for _, t := range g.types {
-				for _, n := range nodes {
-					if n.Type == t {
-						col.items = append(col.items, toItem(n))
-					}
-				}
-			}
-			cols = append(cols, col)
-		}
-
-		tl := buildTimeline(timelineSources{
-			repo:       repo,
-			classifier: classifier,
-			nodes:      nodes,
-			byName:     byName,
-			spines:     sp,
-			commits:    commitsByName,
-			staleAfter: opts.StaleAfter,
-			now:        time.Now(),
-		})
-
-		// Le statut de fusion affiché dans la vue colonnes est celui calculé
-		// pour le graphe, pour que les deux vues ne se contredisent pas.
-		lanes := make(map[string]timelineLane, len(tl.lanes))
-		for _, l := range tl.lanes {
-			if l.kind == laneLive {
-				lanes[l.node.Name] = l
-			}
-		}
-		var current string
-		for ci := range cols {
-			for ii := range cols[ci].items {
-				it := &cols[ci].items[ii]
-				if l, ok := lanes[it.node.Name]; ok {
-					it.staleDays = l.staleDays
-					switch {
-					case len(l.merged) > 0 && len(l.pending) == 0:
-						it.status = statusMerged
-					case len(l.merged) > 0:
-						it.status = statusPartial
-					}
-				}
-				if it.branch.IsHead {
-					current = it.node.Name
-				}
-			}
-		}
-
-		return dataLoadedMsg{columns: cols, timeline: tl, classifier: classifier, currentBranch: current, fingerprint: fingerprint}
+		return dataLoadedMsg{report: report, columns: branchColumns(report), fingerprint: fingerprint}
 	}
+}
+
+// branchColumns groupe les branches par type GitFlow pour le panneau de
+// gauche de la vue colonnes, titrés d'après les préfixes du dépôt ; main
+// puis develop en tête, dans le groupe des permanentes.
+func branchColumns(r gitflow.Report) []column {
+	cfg := r.Classifier.Config
+	groups := []struct {
+		title string
+		types []gitflow.BranchType
+	}{
+		{"permanentes", []gitflow.BranchType{gitflow.TypeMain, gitflow.TypeDevelop}},
+		{cfg.FeaturePrefix + "*", []gitflow.BranchType{gitflow.TypeFeature}},
+		{cfg.BugfixPrefix + "*", []gitflow.BranchType{gitflow.TypeBugfix}},
+		{cfg.ReleasePrefix + "*", []gitflow.BranchType{gitflow.TypeRelease}},
+		{cfg.HotfixPrefix + "*", []gitflow.BranchType{gitflow.TypeHotfix}},
+		{cfg.SupportPrefix + "*", []gitflow.BranchType{gitflow.TypeSupport}},
+		{"autre", []gitflow.BranchType{gitflow.TypeOther}},
+	}
+	cols := make([]column, 0, len(groups))
+	for _, g := range groups {
+		col := column{title: g.title}
+		for _, t := range g.types {
+			for _, st := range r.Branches {
+				if st.Node.Type == t {
+					col.items = append(col.items, st)
+				}
+			}
+		}
+		cols = append(cols, col)
+	}
+	return cols
 }
 
 // currentGraphContent rend la vue graphe selon le mode actif, sans refaire
 // d'appel git : historique complet, ou seulement l'état courant du dépôt.
 func (m Model) currentGraphContent() (string, []graphAnchor) {
-	tl := m.timeline
 	emptyMsg := "Aucune branche feature/release/hotfix, active ou fusionnée."
 	switch {
 	case m.graphMode == graphLive:
-		tl = filterLive(tl)
 		emptyMsg = "Aucune branche en attente de fusion pour le moment."
 	case m.historyAlertsOnly:
-		tl = filterAlerts(tl)
 		emptyMsg = "Historique propre : aucune déviation du workflow GitFlow détectée."
 	}
-	return renderTimeline(tl, emptyMsg, m.graphSelKey)
+	g := newGraphData(m.report, m.graphMode, m.historyAlertsOnly)
+	return renderGraph(g, emptyMsg, m.graphSelKey)
 }
 
 // loadDiff récupère en tâche de fond le contenu complet (git show) du commit
@@ -373,11 +262,11 @@ func (m Model) currentGraphContent() (string, []graphAnchor) {
 // récupérés aussi, pour être affichés avant le diff, puisque celui-ci est en
 // pratique peu informatif pour une fusion propre (git montre alors un diff
 // combiné, généralement vide).
-func loadDiff(repo git.Repository, c git.Commit, width int) tea.Cmd {
+func loadDiff(repo Repository, c gitflow.Commit, width int) tea.Cmd {
 	return func() tea.Msg {
-		var merged []git.Commit
-		if c.IsMerge {
-			if commits, err := repo.MergeCommits(c.Hash); err == nil {
+		var merged []gitflow.Commit
+		if c.IsMerge() {
+			if commits, err := repo.CommitsBetween(c.Parents[0], c.Parents[1]); err == nil {
 				merged = commits
 			}
 		}
@@ -479,13 +368,13 @@ func (m *Model) openGraphSelection() tea.Cmd {
 		return nil
 	}
 	l := m.graphAnchors[i].lane
-	if l.kind == laneLive {
-		return m.openBranch(l.node.Name, "")
+	if l.Kind == gitflow.LaneLive {
+		return m.openBranch(l.Node.Name, "")
 	}
-	for _, refs := range [][]mergeRef{l.merged, l.anomalies} {
+	for _, refs := range [][]gitflow.MergeRef{l.Merged, l.Unexpected} {
 		for _, mr := range refs {
-			if mr.hash != "" {
-				return m.openBranch(mr.target, mr.hash)
+			if mr.Hash != "" {
+				return m.openBranch(mr.Target, mr.Hash)
 			}
 		}
 	}
@@ -503,8 +392,8 @@ func (m *Model) openBranch(name, commitHash string) tea.Cmd {
 	m.restoreBranchSelection()
 	m.commitIdx = 0
 	if it, ok := m.selectedBranchRow(); ok && commitHash != "" {
-		for i, c := range it.commits {
-			if strings.HasPrefix(commitHash, c.Hash) {
+		for i, c := range it.Commits {
+			if c.Hash == commitHash {
 				m.commitIdx = i
 				break
 			}
@@ -587,9 +476,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.lastFingerprint = msg.fingerprint
 		m.columns = msg.columns
-		m.timeline = msg.timeline
-		m.classifier = msg.classifier
-		m.currentBranch = msg.currentBranch
+		m.report = msg.report
 		m.loadedAt = time.Now()
 		m.refreshGraph()
 		m.restoreBranchSelection()
@@ -792,7 +679,7 @@ func (m *Model) moveCommit(d int) {
 	if !ok {
 		return
 	}
-	n := len(it.commits)
+	n := len(it.Commits)
 	if n == 0 {
 		return
 	}
@@ -856,7 +743,7 @@ func (m *Model) restoreBranchSelection() {
 	rows := m.flatBranches()
 	if m.selectedBranchName == "" {
 		for i, row := range rows {
-			if selectableRow(rows, i) && row.it.branch.IsHead {
+			if selectableRow(rows, i) && row.it.Branch.IsHead {
 				m.branchIdx = i
 				m.syncSelectedBranchName()
 				return
@@ -865,7 +752,7 @@ func (m *Model) restoreBranchSelection() {
 	}
 	if m.selectedBranchName != "" {
 		for i, row := range rows {
-			if selectableRow(rows, i) && row.it.node.Name == m.selectedBranchName {
+			if selectableRow(rows, i) && row.it.Node.Name == m.selectedBranchName {
 				m.branchIdx = i
 				return
 			}
@@ -880,7 +767,7 @@ func (m *Model) restoreBranchSelection() {
 func (m *Model) syncSelectedBranchName() {
 	rows := m.flatBranches()
 	if selectableRow(rows, m.branchIdx) {
-		m.selectedBranchName = rows[m.branchIdx].it.node.Name
+		m.selectedBranchName = rows[m.branchIdx].it.Node.Name
 	}
 }
 
@@ -897,7 +784,7 @@ func (m *Model) restoreCommitSelection() {
 		return
 	}
 	if m.selectedCommitHash != "" {
-		for i, c := range it.commits {
+		for i, c := range it.Commits {
 			if c.Hash == m.selectedCommitHash {
 				m.commitIdx = i
 				return
@@ -919,14 +806,14 @@ func (m *Model) syncSelectedCommitHash() {
 	}
 }
 
-func (m Model) visibleItems(col column) []item {
+func (m Model) visibleItems(col column) []gitflow.BranchState {
 	if m.filter == "" {
 		return col.items
 	}
 	needle := strings.ToLower(m.filter)
-	out := make([]item, 0, len(col.items))
+	out := make([]gitflow.BranchState, 0, len(col.items))
 	for _, it := range col.items {
-		if strings.Contains(strings.ToLower(it.node.Name), needle) {
+		if strings.Contains(strings.ToLower(it.Node.Name), needle) {
 			out = append(out, it)
 		}
 	}
@@ -952,22 +839,22 @@ func (m Model) flatBranches() []branchRow {
 	return rows
 }
 
-func (m Model) selectedBranchRow() (item, bool) {
+func (m Model) selectedBranchRow() (gitflow.BranchState, bool) {
 	rows := m.flatBranches()
 	if !selectableRow(rows, m.branchIdx) {
-		return item{}, false
+		return gitflow.BranchState{}, false
 	}
 	return rows[m.branchIdx].it, true
 }
 
-func (m Model) selectedCommit() (git.Commit, bool) {
+func (m Model) selectedCommit() (gitflow.Commit, bool) {
 	it, ok := m.selectedBranchRow()
-	if !ok || len(it.commits) == 0 {
-		return git.Commit{}, false
+	if !ok || len(it.Commits) == 0 {
+		return gitflow.Commit{}, false
 	}
 	idx := m.commitIdx
-	if idx < 0 || idx >= len(it.commits) {
+	if idx < 0 || idx >= len(it.Commits) {
 		idx = 0
 	}
-	return it.commits[idx], true
+	return it.Commits[idx], true
 }

@@ -93,3 +93,16 @@ Les intégrations de pull request en squash (sujet terminé par `(#12)`) ne sont
 | `r` | Rafraîchir les données |
 | `?` | Afficher/masquer l'aide et la légende des symboles |
 | `q` / `Ctrl+C` | Quitter |
+
+## Développement
+
+Le code (dans `src/`) suit une architecture en couches, orientée domaine :
+
+- `internal/gitflow` — le **domaine** : conventions GitFlow (types de branches, parents, cibles de fusion), modèle de l'historique (commits, branches, lignes, écarts) et service `Analyze`, qui confronte l'historique au workflow. Il ne dépend que du port `History`, une interface de lecture de l'historique, sans rien savoir de git.
+- `internal/git` — l'**infrastructure** : implémente `History` en lançant le binaire git (lecture seule), et surveille les changements du dépôt.
+- `internal/tui` — l'**interface** (Bubble Tea) : affiche le rapport d'analyse.
+
+```sh
+go test ./...                     # tests (domaine sur un historique en mémoire, git sur de vrais dépôts temporaires)
+GITFLOW_TUI_BENCH_REPO=/chemin/vers/un/depot go test ./internal/tui -run x -bench LoadData
+```
