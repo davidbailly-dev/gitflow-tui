@@ -108,7 +108,7 @@ func Analyze(h History, opts Options) (Report, error) {
 				st.Ahead, st.Behind, _ = h.AheadBehind(n.Parent, n.Name)
 			}
 			chain, _ := h.FirstParentLog(n.Name)
-			st.Commits = a.ownCommits(n, chain)
+			st.Commits = a.ownCommits(chain)
 			if n.Type.IsEphemeral() {
 				lane := a.liveLane(n, chain, st.Commits)
 				st.Status, st.StaleDays = lane.Status(), lane.StaleDays
@@ -351,23 +351,22 @@ func nearestMatch(chain []Commit, sets ...map[string]bool) int {
 }
 
 // ownCommits renvoie le travail propre de la branche n, d'après sa ligne
-// directe chain : ses commits jusqu'à son point de divergence avec sa
-// branche parente (ou, pour une branche hors GitFlow, avec main ou
-// develop). Contrairement à une simple différence avec la parente, cela
-// reste vrai une fois la branche fusionnée, quand sa parente contient tous
-// ses commits.
-func (a *analysis) ownCommits(n Node, chain []Commit) []Commit {
-	var sets []map[string]bool
-	if n.Parent != "" {
-		sets = append(sets, a.spines[n.Parent])
-	} else {
-		for _, set := range a.spines {
-			sets = append(sets, set)
-		}
+// directe chain : ses commits jusqu'au premier qui appartient à la ligne
+// directe de main ou de develop, c'est-à-dire jusqu'à son vrai point de
+// divergence (cf. divergence). Les deux lignes comptent, pas seulement
+// celle de la parente attendue : une feature partie de main par erreur
+// s'arrête là où elle a quitté main, au lieu d'embarquer tout l'historique
+// de main jusqu'à retomber sur develop. Contrairement à une simple
+// différence avec la parente, cela reste vrai une fois la branche
+// fusionnée, quand sa parente contient tous ses commits.
+func (a *analysis) ownCommits(chain []Commit) []Commit {
+	sets := make([]map[string]bool, 0, len(a.spines))
+	for _, set := range a.spines {
+		sets = append(sets, set)
 	}
 	idx := nearestMatch(chain, sets...)
 	if idx <= 0 {
-		// Pas de parente connue, ou pointe déjà sur une ligne permanente :
+		// Aucune ligne permanente, ou pointe déjà sur l'une d'elles :
 		// branche tout juste créée, sans commit propre (ou intégrée en
 		// fast-forward, indiscernable).
 		return nil

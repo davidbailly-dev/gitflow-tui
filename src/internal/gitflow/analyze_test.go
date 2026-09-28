@@ -347,9 +347,19 @@ func TestFeatureStartedFromMainHasWrongParent(t *testing.T) {
 	h.checkoutNew("feature/mal-partie")
 	h.commit("feat: partie de main")
 
-	l := laneNamed(t, analyze(t, h), "feature/mal-partie")
+	r := analyze(t, h)
+	l := laneNamed(t, r, "feature/mal-partie")
 	if l.WrongParent != "main" {
 		t.Errorf("WrongParent = %q, attendu main", l.WrongParent)
+	}
+	// Ses commits propres s'arrêtent là où elle a quitté main : l'historique
+	// de main (ici la fusion du hotfix) n'en fait pas partie.
+	want := []string{"feat: partie de main"}
+	if got := subjects(l.Commits); !reflect.DeepEqual(got, want) {
+		t.Errorf("commits de la ligne = %v, attendu %v", got, want)
+	}
+	if got := subjects(branchNamed(t, r, "feature/mal-partie").Commits); !reflect.DeepEqual(got, want) {
+		t.Errorf("commits de la branche = %v, attendu %v", got, want)
 	}
 }
 
