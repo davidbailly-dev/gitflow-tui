@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // ErrNotARepo est renvoyée par Open quand le répertoire donné n'est pas (ou
@@ -38,6 +39,21 @@ type Repository interface {
 	Show(hash string, width int) (string, error)
 	CommitDate(ref string) (string, error)
 	IsAncestor(ancestor, descendant string) (bool, error)
+	// CountNotIn compte les commits de branch absents de base, commits de
+	// fusion exclus : le travail réellement produit, pas les intégrations.
+	CountNotIn(branch, base string) (int, error)
+	// ResolveCommit renvoie le hash complet du commit désigné par ref.
+	ResolveCommit(ref string) (string, error)
+	// Tags renvoie, pour chaque commit étiqueté (hash complet), le nom de
+	// ses tags.
+	Tags() (map[string][]string, error)
+	// GitflowConfig renvoie les réglages de la section [gitflow] de la
+	// configuration git (clé complète → valeur), vide si "git flow init"
+	// n'a jamais été lancé.
+	GitflowConfig() (map[string]string, error)
+	// Remote renvoie le remote dont les branches sont analysées, vide pour
+	// les branches locales.
+	Remote() string
 
 	// StateFingerprint renvoie une empreinte bon marché de l'état des refs
 	// (HEAD, branches, refs empaquetées), obtenue par simple lecture de
@@ -55,13 +71,23 @@ type execRepository struct {
 	// contient les refs. Identique à gitDir hors worktree ; pour un worktree
 	// lié, gitDir vaut .git/worktrees/<nom>, qui n'a pas de refs/heads.
 	commonDir string
+
+	// remote, s'il est renseigné, fait analyser les branches de ce remote
+	// (refs/remotes/<remote>/…) au lieu des branches locales. Les noms de
+	// branches restent courts (ex. "develop") pour tout le reste de
+	// l'application : ref les traduit en refs complètes au moment d'appeler
+	// git, d'après branchNames, l'ensemble des noms renvoyés par Branches.
+	remote      string
+	mu          sync.RWMutex
+	branchNames map[string]bool
 }
 
 // Open détecte le dépôt git contenant dir (racine du dépôt) et renvoie un
-// Repository prêt à l'emploi. Elle renvoie ErrNotARepo si dir n'est pas dans
-// un dépôt git.
-func Open(dir string) (Repository, error) {
-	repo := &execRepository{dir: dir}
+// Repository prêt à l'emploi. Si remote est renseigné, ce sont les branches
+// de ce remote qui sont analysées plutôt que les branches locales. Open
+// renvoie ErrNotARepo si dir n'est pas dans un dépôt git.
+func Open(dir, remote string) (Repository, error) {
+	repo := &execRepository{dir: dir, remote: remote}
 	top, err := repo.run("rev-parse", "--show-toplevel")
 	if err != nil {
 		return nil, ErrNotARepo
@@ -79,7 +105,46 @@ func Open(dir string) (Repository, error) {
 		repo.commonDir = repo.absPath(commonDir)
 	}
 
+	if remote != "" {
+		if _, err := repo.run("remote", "get-url", remote); err != nil {
+			return nil, fmt.Errorf("remote %q introuvable", remote)
+		}
+	}
+
 	return repo, nil
+}
+
+// branchRefPrefix est le préfixe des refs des branches analysées.
+func (r *execRepository) branchRefPrefix() string {
+	if r.remote != "" {
+		return "refs/remotes/" + r.remote + "/"
+	}
+	return "refs/heads/"
+}
+
+// ref traduit un nom de branche connu en ref complète (ex. "develop" →
+// "refs/remotes/origin/develop" en mode remote), pour que git désigne sans
+// ambiguïté la branche analysée. Tout autre argument (hash, "hash^2"…) est
+// renvoyé tel quel.
+func (r *execRepository) ref(name string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.branchNames[name] {
+		return r.branchRefPrefix() + name
+	}
+	return name
+}
+
+func (r *execRepository) refs(names []string) []string {
+	out := make([]string, len(names))
+	for i, n := range names {
+		out[i] = r.ref(n)
+	}
+	return out
+}
+
+func (r *execRepository) Remote() string {
+	return r.remote
 }
 
 // absPath résout un chemin renvoyé par git rev-parse, relatif à la racine
@@ -113,14 +178,68 @@ func (r *execRepository) CurrentBranch() (string, error) {
 // les dates servant à ordonner les événements (branches, fusions) partagent
 // ce format, ce qui permet de les comparer comme de simples chaînes.
 func (r *execRepository) CommitDate(ref string) (string, error) {
-	return r.run("log", "-1", "--date=iso-local", "--pretty=format:%cd", ref)
+	return r.run("log", "-1", "--date=iso-local", "--pretty=format:%cd", r.ref(ref))
+}
+
+func (r *execRepository) CountNotIn(branch, base string) (int, error) {
+	out, err := r.run("rev-list", "--count", "--no-merges", r.ref(branch), "--not", r.ref(base))
+	if err != nil {
+		return 0, err
+	}
+	return atoiSafe(out), nil
+}
+
+func (r *execRepository) ResolveCommit(ref string) (string, error) {
+	return r.run("rev-parse", "--verify", "--quiet", r.ref(ref)+"^{commit}")
+}
+
+// Tags lit tous les tags en une seule commande ; pour un tag annoté,
+// %(*objectname) donne le commit pointé (et %(objectname) l'objet tag).
+func (r *execRepository) Tags() (map[string][]string, error) {
+	out, err := r.run("for-each-ref", "--format=%(refname:short)|%(objectname)|%(*objectname)", "refs/tags")
+	if err != nil {
+		return nil, err
+	}
+	tags := make(map[string][]string)
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		commit := parts[1]
+		if parts[2] != "" {
+			commit = parts[2]
+		}
+		tags[commit] = append(tags[commit], parts[0])
+	}
+	return tags, nil
+}
+
+func (r *execRepository) GitflowConfig() (map[string]string, error) {
+	values := make(map[string]string)
+	cmd := exec.Command("git", "config", "--get-regexp", `^gitflow\.`)
+	cmd.Dir = r.dir
+	out, err := cmd.Output()
+	if err != nil {
+		// Code 1 : aucune clé ne correspond, git flow init jamais lancé.
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return values, nil
+		}
+		return nil, fmt.Errorf("git config --get-regexp gitflow: %w", err)
+	}
+	for _, line := range strings.Split(strings.TrimRight(string(out), "\n"), "\n") {
+		key, value, _ := strings.Cut(line, " ")
+		values[key] = value
+	}
+	return values, nil
 }
 
 // IsAncestor renvoie true si ancestor est un ancêtre de descendant (ou lui
 // est identique), c'est-à-dire si descendant contient déjà tout le travail
 // d'ancestor — le signe qu'une branche a été fusionnée.
 func (r *execRepository) IsAncestor(ancestor, descendant string) (bool, error) {
-	cmd := exec.Command("git", "merge-base", "--is-ancestor", ancestor, descendant)
+	cmd := exec.Command("git", "merge-base", "--is-ancestor", r.ref(ancestor), r.ref(descendant))
 	cmd.Dir = r.dir
 	err := cmd.Run()
 	if err == nil {
@@ -153,6 +272,9 @@ func (r *execRepository) StateFingerprint() string {
 	}
 
 	writeTreeFingerprint(h, filepath.Join(r.commonDir, "refs", "heads"))
+	if r.remote != "" {
+		writeTreeFingerprint(h, filepath.Join(r.commonDir, "refs", "remotes", r.remote))
+	}
 	writeTreeFingerprint(h, filepath.Join(r.commonDir, "reftable"))
 
 	return fmt.Sprintf("%x", h.Sum64())

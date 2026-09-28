@@ -16,10 +16,13 @@ type keyMap struct {
 	Filter  key.Binding
 	Help    key.Binding
 	Quit    key.Binding
+	Open    key.Binding
 
-	// Navigate et Scroll ne servent qu'à l'affichage : ils résument dans le
-	// pied de page les touches de déplacement, testées individuellement.
+	// Navigate, Select et Scroll ne servent qu'à l'affichage : ils résument
+	// dans le pied de page les touches de déplacement, testées
+	// individuellement.
 	Navigate key.Binding
+	Select   key.Binding
 	Scroll   key.Binding
 }
 
@@ -35,7 +38,9 @@ var keys = keyMap{
 	Filter:  key.NewBinding(key.WithKeys("/"), key.WithHelp("/", "filtrer")),
 	Help:    key.NewBinding(key.WithKeys("?"), key.WithHelp("?", "aide")),
 	Quit:    key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q", "quitter")),
+	Open:    key.NewBinding(key.WithKeys("enter"), key.WithHelp("entrée", "ouvrir")),
 
 	Navigate: key.NewBinding(key.WithHelp("↑↓←→/hjkl", "naviguer")),
-	Scroll:   key.NewBinding(key.WithHelp("↑↓←→", "défiler")),
+	Select:   key.NewBinding(key.WithHelp("↑↓", "sélectionner")),
+	Scroll:   key.NewBinding(key.WithHelp("←→/pgup/pgdn", "défiler")),
 }

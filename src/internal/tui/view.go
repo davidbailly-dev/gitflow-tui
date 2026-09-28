@@ -86,7 +86,11 @@ func (m Model) renderHeader() string {
 	if m.currentBranch != "" {
 		branch = "● " + m.currentBranch
 	}
-	left := fmt.Sprintf("gitflow-tui · %s · %s · vue: %s", filepath.Base(m.repo.Root()), branch, viewName)
+	repoName := filepath.Base(m.repo.Root())
+	if remote := m.repo.Remote(); remote != "" {
+		repoName += " (branches de " + remote + ")"
+	}
+	left := fmt.Sprintf("gitflow-tui · %s · %s · vue: %s", repoName, branch, viewName)
 
 	right := ""
 	switch {
@@ -120,7 +124,7 @@ func (m Model) renderFooter() string {
 		if m.graphMode == graphHistory {
 			bindings = append(bindings, keys.Alerts)
 		}
-		bindings = append(bindings, keys.Scroll)
+		bindings = append(bindings, keys.Select, keys.Open, keys.Scroll)
 	}
 	bindings = append(bindings, keys.Refresh, keys.Help, keys.Quit)
 
@@ -166,7 +170,7 @@ func (m Model) renderHelp() string {
 	var shortcuts []string
 	shortcuts = append(shortcuts, helpSection("Général", keys.Tab, keys.Refresh, keys.Help, keys.Quit)...)
 	shortcuts = append(shortcuts, helpSection("Vue colonnes", keys.Up, keys.Down, keys.Left, keys.Right, keys.Filter)...)
-	shortcuts = append(shortcuts, helpSection("Vue graphe", keys.Mode, keys.Alerts, keys.Scroll)...)
+	shortcuts = append(shortcuts, helpSection("Vue graphe", keys.Mode, keys.Alerts, keys.Select, keys.Open, keys.Scroll)...)
 
 	var symbols []string
 	symbols = append(symbols, legendSection("Branches",
@@ -175,12 +179,14 @@ func (m Model) renderHelp() string {
 		[2]string{"↓n", "commits de la parente absents de la branche"},
 		[2]string{"✔", "fusionnée dans toutes ses cibles"},
 		[2]string{"⚠", "fusionnée dans une partie de ses cibles"},
+		[2]string{"◷nj", "inactive depuis n jours"},
 		[2]string{"⑂", "commit de fusion"},
 	)...)
 	symbols = append(symbols, legendSection("Graphe",
 		[2]string{"┬ │ └─▶", "départ ou fusion d'une branche"},
 		[2]string{"○", "en cours"},
 		[2]string{"×", "supprimée (reconstituée)"},
+		[2]string{"◆", "tag de version"},
 		[2]string{"⚠", "écart au workflow GitFlow"},
 	)...)
 
@@ -335,14 +341,14 @@ func renderCommitLine(c git.Commit, selected, focused bool) string {
 }
 
 // mergedBranch renvoie la branche source d'un commit de fusion, lue dans
-// son message, et son type GitFlow, pour afficher la branche intégrée par
-// une fusion plutôt que sa seule cible.
-func mergedBranch(subject string) (name string, branchType gitflow.BranchType, ok bool) {
+// son message, et son type GitFlow selon les conventions du dépôt, pour
+// afficher la branche intégrée par une fusion plutôt que sa seule cible.
+func (m Model) mergedBranch(subject string) (name string, branchType gitflow.BranchType, ok bool) {
 	merge, ok := gitflow.ParseMerge(subject)
 	if !ok {
 		return "", 0, false
 	}
-	return merge.Source, gitflow.Classify([]string{merge.Source})[0].Type, true
+	return merge.Source, m.classifier.ClassifyOne(merge.Source).Type, true
 }
 
 // renderDiffPane dessine le panneau "contenu". Son en-tête rappelle la
@@ -357,7 +363,7 @@ func (m Model) renderDiffPane(width int) string {
 
 	var branchLabel string
 	if hasCommit && c.IsMerge {
-		if name, branchType, found := mergedBranch(c.Subject); found {
+		if name, branchType, found := m.mergedBranch(c.Subject); found {
 			branchLabel = lipgloss.NewStyle().Bold(true).Foreground(colorFor(branchType)).Render(name)
 		}
 	}
@@ -416,6 +422,16 @@ func renderItemLine(it item, selected, focused bool) string {
 			parts = append(parts, fmt.Sprintf("↓%d", it.behind))
 		}
 		status = strings.Join(parts, " ")
+	}
+
+	if it.staleDays > 0 {
+		stale := fmt.Sprintf("◷%dj", it.staleDays)
+		if status == "" {
+			status = stale
+		} else {
+			status += " " + stale
+		}
+		statusStyle = lipgloss.NewStyle().Foreground(colorWarning)
 	}
 
 	text := marker + " " + it.node.Name

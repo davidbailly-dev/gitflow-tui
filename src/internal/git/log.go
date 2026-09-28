@@ -42,7 +42,7 @@ func parseCommits(out string) []Commit {
 // aucune des bases, c'est-à-dire les commits propres à branch depuis sa
 // divergence.
 func (r *execRepository) CommitsNotIn(branch string, bases ...string) ([]Commit, error) {
-	args := append([]string{"log", branch, "--not"}, bases...)
+	args := append([]string{"log", r.ref(branch), "--not"}, r.refs(bases)...)
 	out, err := r.run(append(args, "--date=short", "--pretty=format:"+commitFormat)...)
 	if err != nil {
 		return nil, err
@@ -56,7 +56,7 @@ func (r *execRepository) CommitsNotIn(branch string, bases ...string) ([]Commit,
 // contient désormais ; suivre le premier parent évite d'y mêler les commits
 // de develop qu'elle aurait intégrés en cours de route.
 func (r *execRepository) FirstParentCommitsSince(branch, fork string) ([]Commit, error) {
-	out, err := r.run("log", "--first-parent", branch, "--not", fork, "--date=short", "--pretty=format:"+commitFormat)
+	out, err := r.run("log", "--first-parent", r.ref(branch), "--not", fork, "--date=short", "--pretty=format:"+commitFormat)
 	if err != nil {
 		return nil, err
 	}
@@ -85,12 +85,12 @@ func (r *execRepository) MergeCommits(mergeHash string) ([]Commit, error) {
 }
 
 // MergeSubjects renvoie, pour chaque commit de fusion atteignable depuis ref,
-// une ligne "hash|date|sujet" (date de commit, fuseau local). Utilisé pour retrouver dans les messages de
+// une ligne "hash complet|date|sujet" (date de commit, fuseau local). Utilisé pour retrouver dans les messages de
 // fusion la branche intégrée, y compris pour des branches depuis supprimées.
 // Les commits ordinaires sont exclus : une branche simplement citée dans un
 // message ne doit pas passer pour une fusion.
 func (r *execRepository) MergeSubjects(ref string) (string, error) {
-	return r.run("log", ref, "--merges", "--date=iso-local", "--pretty=format:%h|%cd|%s")
+	return r.run("log", r.ref(ref), "--merges", "--date=iso-local", "--pretty=format:%H|%cd|%s")
 }
 
 // FirstParentHashes renvoie, du plus récent (ref lui-même) au plus ancien,
@@ -102,7 +102,7 @@ func (r *execRepository) MergeSubjects(ref string) (string, error) {
 // ancêtre commun lointain comme le ferait un merge-base une fois la branche
 // fusionnée partout.
 func (r *execRepository) FirstParentHashes(ref string) ([]string, error) {
-	out, err := r.run("log", ref, "--first-parent", "--pretty=format:%H")
+	out, err := r.run("log", r.ref(ref), "--first-parent", "--pretty=format:%H")
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +117,7 @@ func (r *execRepository) FirstParentHashes(ref string) ([]string, error) {
 // utilisé pour lister les commits/fusions de main et develop, qui n'ont pas
 // de branche parente dont soustraire les commits.
 func (r *execRepository) FirstParentCommits(ref string) ([]Commit, error) {
-	out, err := r.run("log", ref, "--first-parent", "--date=short", "--pretty=format:"+commitFormat)
+	out, err := r.run("log", r.ref(ref), "--first-parent", "--date=short", "--pretty=format:"+commitFormat)
 	if err != nil {
 		return nil, err
 	}
@@ -142,7 +142,7 @@ func (r *execRepository) Show(hash string, width int) (string, error) {
 // fusion (phase d'amorçage de la branche : premier commit après sa création)
 // sont ignorés, car il n'y a pas d'autre façon de les faire exister.
 func (r *execRepository) DirectCommits(ref string) ([]Commit, error) {
-	out, err := r.run("log", ref, "--first-parent", "--reverse", "--date=short", "--pretty=format:%h|%P|%an|%ad|%s")
+	out, err := r.run("log", r.ref(ref), "--first-parent", "--reverse", "--date=short", "--pretty=format:%h|%P|%an|%ad|%s")
 	if err != nil {
 		return nil, err
 	}

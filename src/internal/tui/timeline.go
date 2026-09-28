@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"gitflow-tui/internal/git"
 	"gitflow-tui/internal/gitflow"
@@ -35,6 +37,7 @@ type mergeRef struct {
 	target string
 	date   string
 	hash   string
+	tag    string // tag de version posé sur cette fusion (cf. checkVersionTags)
 }
 
 // mergeIndex recense, pour chaque branche permanente (cible), les fusions de
@@ -105,6 +108,13 @@ type timelineLane struct {
 	kind        laneKind
 	commits     []git.Commit
 	date        string // position sur l'axe du temps, cf. laneDate
+	// untaggedIn nomme la branche principale quand la fusion de cette
+	// release ou de ce hotfix n'y porte pas de tag de version, dans un
+	// dépôt qui étiquette pourtant ses versions ; vide sinon.
+	untaggedIn string
+	// staleDays est le nombre de jours sans commit d'une branche pas encore
+	// complètement fusionnée, au-delà du seuil d'inactivité ; 0 sinon.
+	staleDays int
 }
 
 // timeline est la représentation prête à être rendue : les deux lignes
@@ -116,7 +126,23 @@ type timeline struct {
 	develop       *timelineLane
 	mainDirect    []git.Commit
 	developDirect []git.Commit
-	lanes         []timelineLane
+	// unreleased est le nombre de commits (hors fusions) de develop pas
+	// encore arrivés dans main : le contenu de la prochaine release.
+	unreleased int
+	lanes      []timelineLane
+}
+
+// timelineSources rassemble ce dont buildTimeline a besoin : le dépôt, ses
+// conventions GitFlow, et les données déjà chargées pour la vue colonnes.
+type timelineSources struct {
+	repo       git.Repository
+	classifier gitflow.Classifier
+	nodes      []gitflow.Node
+	byName     map[string]git.Branch
+	spines     spines
+	commits    map[string][]git.Commit // commits propres de chaque branche locale
+	staleAfter time.Duration           // 0 : pas de détection d'inactivité
+	now        time.Time
 }
 
 // foundMerge associe une fusion lue dans un message de commit au commit
@@ -180,23 +206,26 @@ func scanSyncEvents(repo git.Repository, mainRef, developName string) []mergeRef
 // Chaque ligne (branche locale, branche reconstituée depuis l'historique, ou
 // synchronisation develop → main) est datée selon une même règle (cf.
 // laneDate), qui fixe sa colonne sur l'axe du temps commun aux deux lignes
-// permanentes. commits donne, pour chaque branche locale, ses commits
-// propres, déjà calculés pour la vue colonnes.
-func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []gitflow.Node, byName map[string]git.Branch, sp spines, commits map[string][]git.Commit) timeline {
+// permanentes.
+func buildTimeline(src timelineSources) timeline {
+	repo, classifier, byName := src.repo, src.classifier, src.byName
 	var tl timeline
 	var ephemeral []gitflow.Node
 
-	for _, n := range nodes {
-		switch n.Type {
-		case gitflow.TypeMain:
+	for _, n := range src.nodes {
+		switch {
+		case n.Type == gitflow.TypeMain:
 			l := timelineLane{node: n, branch: byName[n.Name]}
 			tl.main = &l
-		case gitflow.TypeDevelop:
+		case n.Type == gitflow.TypeDevelop:
 			l := timelineLane{node: n, branch: byName[n.Name]}
 			tl.develop = &l
-		case gitflow.TypeFeature, gitflow.TypeRelease, gitflow.TypeHotfix:
+		case n.Type.IsEphemeral():
 			ephemeral = append(ephemeral, n)
 		}
+	}
+	if tl.main != nil && tl.develop != nil {
+		tl.unreleased, _ = repo.CountNotIn(tl.develop.node.Name, tl.main.node.Name)
 	}
 
 	mergesByTarget := make(mergeIndex, 2)
@@ -211,7 +240,9 @@ func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []g
 
 	var lanes []timelineLane
 	for _, n := range ephemeral {
-		lanes = append(lanes, liveLane(repo, classifier, n, byName[n.Name], commits[n.Name], mergesByTarget, sp))
+		lane := liveLane(repo, classifier, n, byName[n.Name], src.commits[n.Name], mergesByTarget, src.spines)
+		lane.staleDays = staleDays(lane, src.staleAfter, src.now)
+		lanes = append(lanes, lane)
 	}
 
 	seen := make(map[string]bool, len(byName))
@@ -245,6 +276,10 @@ func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []g
 		}
 	}
 
+	if tl.main != nil {
+		checkVersionTags(repo, classifier, tl.main.node.Name, lanes)
+	}
+
 	sort.Slice(lanes, func(i, j int) bool {
 		if lanes[i].date != lanes[j].date {
 			return lanes[i].date < lanes[j].date
@@ -256,6 +291,70 @@ func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []g
 	}
 	tl.lanes = lanes
 	return tl
+}
+
+// staleDays renvoie le nombre de jours écoulés depuis le dernier commit
+// d'une branche locale pas encore complètement fusionnée, s'il dépasse
+// staleAfter ; 0 sinon (seuil nul, branche fusionnée, date illisible).
+func staleDays(l timelineLane, staleAfter time.Duration, now time.Time) int {
+	if staleAfter <= 0 || len(l.pending) == 0 {
+		return 0
+	}
+	last, err := time.Parse("2006-01-02 15:04:05 -0700", l.branch.CommitDate)
+	if err != nil {
+		return 0
+	}
+	idle := now.Sub(last)
+	if idle < staleAfter {
+		return 0
+	}
+	return maxInt(int(idle.Hours()/24), 1)
+}
+
+// checkVersionTags retrouve le tag de version de chaque fusion de release
+// ou de hotfix dans mainName : posé sur le commit de fusion (git flow), ou
+// à défaut sur la pointe de la branche fusionnée. Une fusion sans tag est
+// signalée (untaggedIn) — sauf si le dépôt n'a aucun tag de version, signe
+// qu'il ne suit pas cette convention.
+func checkVersionTags(repo git.Repository, classifier gitflow.Classifier, mainName string, lanes []timelineLane) {
+	all, err := repo.Tags()
+	if err != nil {
+		return
+	}
+	tags := make(map[string][]string, len(all))
+	for commit, names := range all {
+		for _, name := range names {
+			if classifier.Config.IsVersionTag(name) {
+				tags[commit] = append(tags[commit], name)
+			}
+		}
+	}
+	if len(tags) == 0 {
+		return
+	}
+	for i := range lanes {
+		l := &lanes[i]
+		if l.node.Type != gitflow.TypeRelease && l.node.Type != gitflow.TypeHotfix {
+			continue
+		}
+		for j := range l.merged {
+			mr := &l.merged[j]
+			if mr.target != mainName || mr.hash == "" {
+				continue
+			}
+			found := tags[mr.hash]
+			if len(found) == 0 {
+				if tip, err := repo.ResolveCommit(mr.hash + "^2"); err == nil {
+					found = tags[tip]
+				}
+			}
+			if len(found) > 0 {
+				mr.tag = found[0]
+			} else {
+				l.untaggedIn = mainName
+			}
+		}
+	}
 }
 
 // directCommits renvoie les commits arrivés directement sur ref, hors
@@ -397,13 +496,13 @@ func deletedLane(repo git.Repository, node gitflow.Node, merges mergeIndex) (tim
 // main plutôt que sous develop. Le critère est la cible de fusion attendue
 // pour le type de branche, pas son origine : une release part de develop
 // mais son but est d'atterrir dans main, donc elle va avec main — comme les
-// hotfix et les synchronisations develop → main. Seule feature, qui ne doit
-// fusionner que dans develop, va avec develop.
+// hotfix et les synchronisations develop → main. Seules feature et bugfix,
+// qui ne doivent fusionner que dans develop, vont avec develop.
 func laneBelongsToMain(l timelineLane) bool {
 	switch l.node.Type {
 	case gitflow.TypeRelease, gitflow.TypeHotfix:
 		return true
-	case gitflow.TypeFeature:
+	case gitflow.TypeFeature, gitflow.TypeBugfix:
 		return false
 	default:
 		return l.kind == laneSync
@@ -436,10 +535,11 @@ func filterLive(tl timeline) timeline {
 // laneHasAlert indique si une ligne signale une déviation du workflow
 // GitFlow standard : fusion hors flow attendu pour ce type de branche,
 // branche apparemment partie de la mauvaise ligne principale,
-// synchronisation directe develop → main, ou fusion partielle (certaines
-// cibles atteintes, d'autres non).
+// synchronisation directe develop → main, fusion partielle (certaines
+// cibles atteintes, d'autres non), fusion dans main sans tag de version, ou
+// branche inactive depuis trop longtemps.
 func laneHasAlert(l timelineLane) bool {
-	if len(l.anomalies) > 0 || l.wrongParent != "" || l.kind == laneSync {
+	if len(l.anomalies) > 0 || l.wrongParent != "" || l.kind == laneSync || l.untaggedIn != "" || l.staleDays > 0 {
 		return true
 	}
 	return len(l.merged) > 0 && len(l.pending) > 0
@@ -507,9 +607,13 @@ func rails(width int, open []timelineLane) string {
 // à droite) à la plus ancienne. Dans cet ordre, les traits verticaux des
 // lignes restant à dessiner passent toujours à gauche du texte de la ligne
 // courante, sans jamais le croiser.
-func renderTimeline(tl timeline, emptyMsg string) string {
+//
+// Il renvoie aussi, dans l'ordre d'affichage, la position (numéro de ligne)
+// de chaque ligne de branche, pour la sélection au clavier ; selectedKey
+// désigne la ligne sélectionnée (cf. laneKey), dont le nom est surligné.
+func renderTimeline(tl timeline, emptyMsg, selectedKey string) (string, []graphAnchor) {
 	if tl.main == nil && tl.develop == nil {
-		return "Aucune branche main/develop trouvée."
+		return "Aucune branche main/develop trouvée.", nil
 	}
 
 	tl.lanes = compactColumns(tl.lanes)
@@ -528,6 +632,7 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 	}
 
 	var b strings.Builder
+	var anchors []graphAnchor
 	if axis := renderAxis(tl.lanes); axis != "" {
 		b.WriteString(axis)
 		b.WriteString("\n")
@@ -544,7 +649,13 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 			b.WriteString("\n")
 		}
 		for i, l := range group {
-			b.WriteString(renderLane(l, group[i+1:]))
+			anchors = append(anchors, graphAnchor{line: strings.Count(b.String(), "\n"), lane: l})
+			b.WriteString(renderLane(l, group[i+1:], laneKey(l) == selectedKey))
+			b.WriteString("\n")
+		}
+		if spine == tl.develop && tl.unreleased > 0 && tl.main != nil {
+			b.WriteString(strings.Repeat(" ", laneLabelWidth))
+			b.WriteString(styleFaint.Render(fmt.Sprintf("↑ %d commit(s) pas encore dans %s — contenu de la prochaine release", tl.unreleased, tl.main.node.Name)))
 			b.WriteString("\n")
 		}
 		if block := renderDirectCommits(spine.node.Name, direct); block != "" {
@@ -562,7 +673,20 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 		b.WriteString("\n")
 	}
 
-	return strings.TrimRight(b.String(), "\n")
+	return strings.TrimRight(b.String(), "\n"), anchors
+}
+
+// graphAnchor situe une ligne de branche dans le rendu du graphe.
+type graphAnchor struct {
+	line int
+	lane timelineLane
+}
+
+// laneKey identifie une ligne du graphe d'un rendu à l'autre, pour garder
+// la sélection après un rechargement ou un changement de mode (plusieurs
+// synchronisations develop → main portent le même nom, d'où la date).
+func laneKey(l timelineLane) string {
+	return fmt.Sprintf("%d|%s|%s", l.kind, l.node.Name, l.date)
 }
 
 // renderAxis dessine l'axe du temps, au-dessus des lignes permanentes :
@@ -712,8 +836,10 @@ func renderSpine(spineColor lipgloss.Color, spine timelineLane, length int, lane
 	if spine.branch.IsHead {
 		marker = "●"
 	}
-	// Nom tronqué pour ne pas décaler l'axe du temps (cf. laneLabelWidth).
-	head := lipgloss.NewStyle().Foreground(spineColor).Bold(true).Render(fmt.Sprintf("%s %-9.9s", marker, spine.node.Name))
+	// Nom tronqué pour ne pas décaler l'axe du temps (cf. laneLabelWidth),
+	// en gardant une espace avant le trait.
+	name := ansi.Truncate(spine.node.Name, laneLabelWidth-3, "…")
+	head := lipgloss.NewStyle().Foreground(spineColor).Bold(true).Render(fmt.Sprintf("%s %-*s", marker, laneLabelWidth-2, name))
 	return head + body.String()
 }
 
@@ -725,7 +851,7 @@ func renderSpine(spineColor lipgloss.Color, spine timelineLane, length int, lane
 // en atténué avec la mention "supprimée" ; toute fusion en dehors du flow
 // GitFlow attendu (develop → main direct, feature → main, fusion
 // incomplète...) est signalée en couleur d'alerte.
-func renderLane(l timelineLane, open []timelineLane) string {
+func renderLane(l timelineLane, open []timelineLane, selected bool) string {
 	color := laneColor(l)
 	indent := rails(laneX(l), open)
 	subIndent := indent + "    "
@@ -752,11 +878,14 @@ func renderLane(l timelineLane, open []timelineLane) string {
 
 	var parts []string
 	for _, mr := range l.merged {
+		part := mr.target
 		if mr.date != "" {
-			parts = append(parts, fmt.Sprintf("%s (%s)", mr.target, shortDate(mr.date)))
-		} else {
-			parts = append(parts, mr.target)
+			part += fmt.Sprintf(" (%s)", shortDate(mr.date))
 		}
+		if mr.tag != "" {
+			part += " " + lipgloss.NewStyle().Foreground(colorRelease).Render("◆ "+mr.tag)
+		}
+		parts = append(parts, part)
 	}
 	// Une branche supprimée ne sera plus fusionnée : sa cible manquante
 	// n'est pas "en attente" mais définitivement ratée.
@@ -791,7 +920,7 @@ func renderLane(l timelineLane, open []timelineLane) string {
 	}
 
 	lines := []string{fmt.Sprintf("%s%s %s%s  → %s   %s",
-		indent, connector, marker, nameStyle.Render(l.node.Name), targetTxt, status)}
+		indent, connector, marker, nameText(nameStyle, l.node.Name, selected), targetTxt, status)}
 
 	for _, mr := range l.anomalies {
 		txt := fmt.Sprintf("⚠ fusionnée directement dans %s", mr.target)
@@ -800,6 +929,14 @@ func renderLane(l timelineLane, open []timelineLane) string {
 		}
 		txt += " — hors GitFlow"
 		lines = append(lines, subIndent+warnStyle.Render(txt))
+	}
+
+	if l.untaggedIn != "" {
+		lines = append(lines, subIndent+warnStyle.Render(fmt.Sprintf("⚠ fusionnée dans %s sans tag de version — hors GitFlow", l.untaggedIn)))
+	}
+
+	if l.staleDays > 0 {
+		lines = append(lines, subIndent+warnStyle.Render(fmt.Sprintf("⚠ aucun commit depuis %d jours — branche à finir ou à abandonner", l.staleDays)))
 	}
 
 	if l.wrongParent != "" {
@@ -824,6 +961,14 @@ func renderLane(l timelineLane, open []timelineLane) string {
 	}
 
 	return strings.Join(lines, "\n")
+}
+
+// nameText rend le nom d'une ligne, surligné si elle est sélectionnée.
+func nameText(style lipgloss.Style, name string, selected bool) string {
+	if selected {
+		return selectionStyle(style.Faint(false), true).Render(name)
+	}
+	return style.Render(name)
 }
 
 // laneColor renvoie la couleur d'une ligne : celle de son type GitFlow, ou

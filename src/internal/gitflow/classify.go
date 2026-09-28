@@ -12,8 +12,10 @@ const (
 	TypeMain BranchType = iota
 	TypeDevelop
 	TypeFeature
+	TypeBugfix
 	TypeRelease
 	TypeHotfix
+	TypeSupport
 	TypeOther
 )
 
@@ -26,25 +28,36 @@ type Node struct {
 }
 
 // IsEphemeral indique si le type correspond à une branche de travail
-// temporaire (feature, release, hotfix), destinée à être fusionnée puis
-// supprimée.
+// temporaire (feature, bugfix, release, hotfix), destinée à être fusionnée
+// puis supprimée. Une branche support, qui maintient une ancienne version
+// sans jamais être refusionnée, n'en est pas une.
 func (t BranchType) IsEphemeral() bool {
-	return t == TypeFeature || t == TypeRelease || t == TypeHotfix
+	return t == TypeFeature || t == TypeBugfix || t == TypeRelease || t == TypeHotfix
 }
 
 // Classifier applique les règles GitFlow en connaissant les noms réels des
-// deux branches permanentes du dépôt : parents et cibles de fusion des
-// branches éphémères en dépendent (un hotfix part de "master" sur un dépôt
-// qui n'a pas de "main").
+// deux branches permanentes du dépôt et ses préfixes de branches : parents
+// et cibles de fusion des branches éphémères en dépendent (un hotfix part
+// de "master" sur un dépôt qui n'a pas de "main").
 type Classifier struct {
 	Main    string
 	Develop string
+	Config  Config
 }
 
-// NewClassifier déduit les branches permanentes d'après les branches
-// existantes : "main" si elle existe, sinon "master" ; "main" par
-// convention si aucune des deux n'existe.
-func NewClassifier(names []string) Classifier {
+// NewClassifier applique cfg aux branches existantes. Si cfg ne fixe pas la
+// branche principale, elle est déduite des branches existantes : "main" si
+// elle existe, sinon "master" ; "main" par convention si aucune des deux
+// n'existe.
+func NewClassifier(names []string, cfg Config) Classifier {
+	c := Classifier{Main: cfg.Main, Develop: cfg.Develop, Config: cfg}
+	if c.Develop == "" {
+		c.Develop = "develop"
+	}
+	if c.Main != "" {
+		return c
+	}
+
 	hasMain, hasMaster := false, false
 	for _, name := range names {
 		switch name {
@@ -54,7 +67,7 @@ func NewClassifier(names []string) Classifier {
 			hasMaster = true
 		}
 	}
-	c := Classifier{Main: "main", Develop: "develop"}
+	c.Main = "main"
 	if !hasMain && hasMaster {
 		c.Main = "master"
 	}
@@ -75,23 +88,29 @@ func (c Classifier) Classify(names []string) []Node {
 // retenue par le classifieur est de type TypeMain : si "main" et "master"
 // coexistent, "master" est rangée parmi les autres branches.
 func (c Classifier) ClassifyOne(name string) Node {
+	has := func(prefix string) bool { return prefix != "" && strings.HasPrefix(name, prefix) }
 	switch {
 	case name == c.Main:
 		return Node{Name: name, Type: TypeMain}
 	case name == c.Develop:
 		return Node{Name: name, Type: TypeDevelop}
-	case strings.HasPrefix(name, "feature/"):
+	case has(c.Config.FeaturePrefix):
 		return Node{Name: name, Type: TypeFeature, Parent: c.Develop, MergeTargets: []string{c.Develop}}
-	case strings.HasPrefix(name, "release/"):
+	case has(c.Config.BugfixPrefix):
+		return Node{Name: name, Type: TypeBugfix, Parent: c.Develop, MergeTargets: []string{c.Develop}}
+	case has(c.Config.ReleasePrefix):
 		return Node{Name: name, Type: TypeRelease, Parent: c.Develop, MergeTargets: []string{c.Develop, c.Main}}
-	case strings.HasPrefix(name, "hotfix/"):
+	case has(c.Config.HotfixPrefix):
 		return Node{Name: name, Type: TypeHotfix, Parent: c.Main, MergeTargets: []string{c.Main, c.Develop}}
+	case has(c.Config.SupportPrefix):
+		return Node{Name: name, Type: TypeSupport, Parent: c.Main}
 	default:
 		return Node{Name: name, Type: TypeOther}
 	}
 }
 
-// Classify classifie names avec un classifieur déduit de ces mêmes noms.
+// Classify classifie names avec les conventions par défaut, la branche
+// principale étant déduite de ces mêmes noms.
 func Classify(names []string) []Node {
-	return NewClassifier(names).Classify(names)
+	return NewClassifier(names, DefaultConfig()).Classify(names)
 }

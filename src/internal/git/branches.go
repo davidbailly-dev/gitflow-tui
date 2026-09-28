@@ -10,36 +10,46 @@ type Branch struct {
 	IsHead     bool
 }
 
-const branchFormat = "%(refname:short)|%(objectname:short)|%(committerdate:iso-local)"
+const branchFormat = "%(refname)|%(objectname:short)|%(committerdate:iso-local)"
 
+// Branches renvoie les branches analysées : locales, ou celles du remote
+// choisi à l'ouverture (sans son "HEAD" symbolique), sous leur nom court.
 func (r *execRepository) Branches() ([]Branch, error) {
-	out, err := r.run("for-each-ref", "--format="+branchFormat, "refs/heads")
+	prefix := r.branchRefPrefix()
+	out, err := r.run("for-each-ref", "--format="+branchFormat, prefix)
 	if err != nil {
 		return nil, err
 	}
 	current, _ := r.CurrentBranch()
 
 	var branches []Branch
+	names := make(map[string]bool)
 	for _, line := range strings.Split(out, "\n") {
-		if line == "" {
-			continue
-		}
 		parts := strings.SplitN(line, "|", 3)
 		if len(parts) != 3 {
 			continue
 		}
+		name := strings.TrimPrefix(parts[0], prefix)
+		if name == "HEAD" {
+			continue
+		}
+		names[name] = true
 		branches = append(branches, Branch{
-			Name:       parts[0],
+			Name:       name,
 			Head:       parts[1],
 			CommitDate: parts[2],
-			IsHead:     parts[0] == current,
+			IsHead:     name == current,
 		})
 	}
+
+	r.mu.Lock()
+	r.branchNames = names
+	r.mu.Unlock()
 	return branches, nil
 }
 
 func (r *execRepository) AheadBehind(base, branch string) (int, int, error) {
-	out, err := r.run("rev-list", "--left-right", "--count", base+"..."+branch)
+	out, err := r.run("rev-list", "--left-right", "--count", r.ref(base)+"..."+r.ref(branch))
 	if err != nil {
 		return 0, 0, err
 	}

@@ -14,8 +14,10 @@ var (
 	colorMain    = lipgloss.Color("170") // orchidée
 	colorDevelop = lipgloss.Color("39")  // bleu
 	colorFeature = lipgloss.Color("42")  // vert
+	colorBugfix  = lipgloss.Color("79")  // vert d'eau
 	colorRelease = lipgloss.Color("220") // jaune
 	colorHotfix  = lipgloss.Color("196") // rouge
+	colorSupport = lipgloss.Color("141") // lavande
 	colorOther   = lipgloss.Color("245") // gris
 	colorWarning = lipgloss.Color("208") // orange : alertes uniquement
 	colorMerge   = lipgloss.Color("110") // bleu-gris : commits de fusion
@@ -53,10 +55,14 @@ func colorFor(t gitflow.BranchType) lipgloss.Color {
 		return colorDevelop
 	case gitflow.TypeFeature:
 		return colorFeature
+	case gitflow.TypeBugfix:
+		return colorBugfix
 	case gitflow.TypeRelease:
 		return colorRelease
 	case gitflow.TypeHotfix:
 		return colorHotfix
+	case gitflow.TypeSupport:
+		return colorSupport
 	default:
 		return colorOther
 	}
