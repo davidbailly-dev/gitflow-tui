@@ -35,10 +35,25 @@ func parseCommits(out string) []Commit {
 	return commits
 }
 
-// CommitsNotIn renvoie les commits atteignables depuis branch mais pas depuis
-// base, c'est-à-dire les commits propres à branch depuis sa divergence.
-func (r *execRepository) CommitsNotIn(branch, base string) ([]Commit, error) {
-	out, err := r.run("log", branch, "--not", base, "--date=short", "--pretty=format:"+commitFormat)
+// CommitsNotIn renvoie les commits atteignables depuis branch mais depuis
+// aucune des bases, c'est-à-dire les commits propres à branch depuis sa
+// divergence.
+func (r *execRepository) CommitsNotIn(branch string, bases ...string) ([]Commit, error) {
+	args := append([]string{"log", branch, "--not"}, bases...)
+	out, err := r.run(append(args, "--date=short", "--pretty=format:"+commitFormat)...)
+	if err != nil {
+		return nil, err
+	}
+	return parseCommits(out), nil
+}
+
+// FirstParentCommitsSince renvoie les commits de la ligne directe (premier
+// parent) de branch postérieurs à fork. Sert à retrouver les commits d'une
+// branche déjà fusionnée, que CommitsNotIn ne voit plus puisque sa base les
+// contient désormais ; suivre le premier parent évite d'y mêler les commits
+// de develop qu'elle aurait intégrés en cours de route.
+func (r *execRepository) FirstParentCommitsSince(branch, fork string) ([]Commit, error) {
+	out, err := r.run("log", "--first-parent", branch, "--not", fork, "--date=short", "--pretty=format:"+commitFormat)
 	if err != nil {
 		return nil, err
 	}
@@ -67,12 +82,12 @@ func (r *execRepository) MergeCommits(mergeHash string) ([]Commit, error) {
 }
 
 // MergeSubjects renvoie, pour chaque commit de fusion atteignable depuis ref,
-// une ligne "hash|date|sujet". Utilisé pour retrouver dans les messages de
+// une ligne "hash|date|sujet" (date de commit, fuseau local). Utilisé pour retrouver dans les messages de
 // fusion la branche intégrée, y compris pour des branches depuis supprimées.
 // Les commits ordinaires sont exclus : une branche simplement citée dans un
 // message ne doit pas passer pour une fusion.
 func (r *execRepository) MergeSubjects(ref string) (string, error) {
-	return r.run("log", ref, "--merges", "--date=iso8601", "--pretty=format:%h|%ad|%s")
+	return r.run("log", ref, "--merges", "--date=iso-local", "--pretty=format:%h|%cd|%s")
 }
 
 // FirstParentHashes renvoie, du plus récent (ref lui-même) au plus ancien,

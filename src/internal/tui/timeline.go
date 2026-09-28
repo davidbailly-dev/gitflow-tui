@@ -16,9 +16,10 @@ import (
 const cellWidth = 3
 
 // laneLabelWidth est la largeur du préfixe (marqueur + nom de ligne) placé
-// avant le corps du diagramme sur les lignes main/develop. Les lignes des
-// branches éphémères démarrent leur propre indentation à la même colonne
-// pour que leurs repères "└─▶" restent alignés avec les "┬" correspondants.
+// avant le corps du diagramme sur les lignes main/develop : la colonne col
+// du diagramme se trouve donc à laneLabelWidth + col*cellWidth caractères
+// du bord (cf. laneX), sur la ligne permanente comme sur les lignes des
+// branches, dont le repère "└─▶" tombe ainsi sous le "┬" correspondant.
 const laneLabelWidth = 11
 
 // maxCommitsShown limite le nombre de commits listés sous chaque fusion.
@@ -84,18 +85,6 @@ func (idx mergeIndex) unexpected(node gitflow.Node) []mergeRef {
 	return out
 }
 
-// nearestMatch renvoie la position, dans chain (une chaîne "premier parent"
-// classée du plus récent au plus ancien), du premier commit appartenant à
-// set — ou -1 si aucun ne correspond.
-func nearestMatch(chain []string, set map[string]bool) int {
-	for i, h := range chain {
-		if set[h] {
-			return i
-		}
-	}
-	return -1
-}
-
 type laneKind int
 
 const (
@@ -115,6 +104,7 @@ type timelineLane struct {
 	wrongParent string     // non vide si la branche semble être partie de cette autre branche plutôt que de son parent attendu
 	kind        laneKind
 	commits     []git.Commit
+	date        string // position sur l'axe du temps, cf. laneDate
 }
 
 // timeline est la représentation prête à être rendue : les deux lignes
@@ -188,10 +178,11 @@ func scanSyncEvents(repo git.Repository, mainRef, developName string) []mergeRef
 
 // buildTimeline construit le diagramme à partir des branches classifiées.
 // Chaque ligne (branche locale, branche reconstituée depuis l'historique, ou
-// synchronisation develop → main) se voit attribuer une colonne unique
-// d'après sa date, utilisée à la fois pour son propre repère et pour le
-// repère correspondant sur la ou les lignes concernées.
-func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []gitflow.Node, byName map[string]git.Branch) timeline {
+// synchronisation develop → main) est datée selon une même règle (cf.
+// laneDate), qui fixe sa colonne sur l'axe du temps commun aux deux lignes
+// permanentes. commits donne, pour chaque branche locale, ses commits
+// propres, déjà calculés pour la vue colonnes.
+func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []gitflow.Node, byName map[string]git.Branch, sp spines, commits map[string][]git.Commit) timeline {
 	var tl timeline
 	var ephemeral []gitflow.Node
 
@@ -209,161 +200,34 @@ func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []g
 	}
 
 	mergesByTarget := make(mergeIndex, 2)
-	mainSpine := map[string]bool{}
-	developSpine := map[string]bool{}
 	if tl.main != nil {
 		mergesByTarget[tl.main.node.Name] = scanMergeEvents(repo, classifier, tl.main.node.Name)
-		if commits, err := repo.DirectCommits(tl.main.node.Name); err == nil {
-			tl.mainDirect = commits
-		}
-		if hashes, err := repo.FirstParentHashes(tl.main.node.Name); err == nil {
-			for _, h := range hashes {
-				mainSpine[h] = true
-			}
-		}
+		tl.mainDirect = directCommits(repo, tl.main.node.Name)
 	}
 	if tl.develop != nil {
 		mergesByTarget[tl.develop.node.Name] = scanMergeEvents(repo, classifier, tl.develop.node.Name)
-		if commits, err := repo.DirectCommits(tl.develop.node.Name); err == nil {
-			tl.developDirect = commits
-		}
-		if hashes, err := repo.FirstParentHashes(tl.develop.node.Name); err == nil {
-			for _, h := range hashes {
-				developSpine[h] = true
-			}
-		}
+		tl.developDirect = directCommits(repo, tl.develop.node.Name)
 	}
 
-	type candidate struct {
-		node        gitflow.Node
-		date        string
-		kind        laneKind
-		refs        []mergeRef // pré-calculées pour laneDeleted et laneSync
-		anomalies   []mergeRef // pré-calculées pour laneDeleted
-		pending     []string   // pré-calculées pour laneDeleted : cibles jamais atteintes
-		wrongParent string     // renseigné si le point de divergence appartient en fait à l'autre ligne principale
-	}
-
-	var mainName, developName string
-	if tl.main != nil {
-		mainName = tl.main.node.Name
-	}
-	if tl.develop != nil {
-		developName = tl.develop.node.Name
-	}
-
-	candidates := make([]candidate, 0, len(ephemeral))
+	var lanes []timelineLane
 	for _, n := range ephemeral {
-		date := byName[n.Name].CommitDate
-		if n.Parent != "" {
-			if base, err := repo.MergeBase(n.Name, n.Parent); err == nil {
-				if d, err := repo.CommitDate(base); err == nil {
-					date = d
-				}
-			}
-		}
-
-		// Le vrai point de divergence de la branche est le premier commit de
-		// sa propre ligne (premier parent) qui appartient aussi à l'une des
-		// deux branches principales — pas un simple ancêtre commun lointain
-		// (une fois la branche fusionnée partout, un merge-base avec
-		// n'importe quelle branche renvoie trivialement sa propre pointe).
-		// Si ce point est plus proche de la pointe côté de l'autre branche
-		// principale que côté du parent attendu, la branche a probablement
-		// été créée depuis cette autre branche.
-		var wrongParent string
-		var otherParent string
-		var expectedSpine, otherSpine map[string]bool
-		switch n.Parent {
-		case developName:
-			expectedSpine, otherSpine, otherParent = developSpine, mainSpine, mainName
-		case mainName:
-			expectedSpine, otherSpine, otherParent = mainSpine, developSpine, developName
-		}
-		if otherParent != "" {
-			if chain, err := repo.FirstParentHashes(n.Name); err == nil {
-				idxExpected := nearestMatch(chain, expectedSpine)
-				idxOther := nearestMatch(chain, otherSpine)
-				if idxOther >= 0 && (idxExpected < 0 || idxOther < idxExpected) {
-					wrongParent = otherParent
-				}
-			}
-		}
-
-		candidates = append(candidates, candidate{node: n, date: date, wrongParent: wrongParent})
+		lanes = append(lanes, liveLane(repo, classifier, n, byName[n.Name], commits[n.Name], mergesByTarget, sp))
 	}
 
-	seen := make(map[string]bool, len(candidates))
+	seen := make(map[string]bool, len(byName))
 	for name := range byName {
 		seen[name] = true
 	}
-	mentioned := make(map[string]bool)
-	for _, events := range mergesByTarget {
-		for name := range events {
-			mentioned[name] = true
-		}
-	}
-	for name := range mentioned {
-		if seen[name] {
-			continue
-		}
-		seen[name] = true
-
-		node := classifier.ClassifyOne(name)
-
-		// On ne retient comme fusion "normale" que les cibles réellement
-		// valides pour ce type de branche (ex. develop pour une feature).
-		var refs []mergeRef
-		for _, target := range node.MergeTargets {
-			if ev, ok := mergesByTarget.latest(target, name); ok {
-				refs = append(refs, ev)
-			}
-		}
-
-		// Une fusion trouvée dans une cible non valide (ex. main pour une
-		// feature) est soit un écho transitif (même commit que l'une des
-		// fusions valides — main a ensuite intégré develop), soit une vraie
-		// anomalie : une fusion directe hors du flow attendu.
-		anomalies := mergesByTarget.unexpected(node)
-
-		if len(refs) == 0 && len(anomalies) == 0 {
-			continue
-		}
-		sort.Slice(refs, func(i, j int) bool { return refs[i].date < refs[j].date })
-
-		date := ""
-		if len(refs) > 0 {
-			date = refs[0].date
-		}
-		if len(anomalies) > 0 && (date == "" || anomalies[0].date < date) {
-			date = anomalies[0].date
-		}
-
-		// Une cible valide sans fusion identifiée peut malgré tout contenir
-		// le travail de la branche, arrivé par un autre chemin (hotfix
-		// fusionné dans la release en cours, qui a ensuite rejoint
-		// develop) : le second parent d'une fusion connue est la pointe de
-		// la branche supprimée, il suffit de vérifier que la cible la
-		// contient. Sinon la cible n'a jamais été atteinte.
-		var tip string
-		if len(refs) > 0 {
-			tip = refs[0].hash + "^2"
-		} else {
-			tip = anomalies[0].hash + "^2"
-		}
-		var pending []string
-		for _, target := range node.MergeTargets {
-			if _, ok := mergesByTarget.latest(target, name); ok {
+	for _, bySource := range mergesByTarget {
+		for name := range bySource {
+			if seen[name] {
 				continue
 			}
-			if merged, err := repo.IsAncestor(tip, target); err == nil && merged {
-				refs = append(refs, mergeRef{target: target})
-				continue
+			seen[name] = true
+			if lane, ok := deletedLane(repo, classifier.ClassifyOne(name), mergesByTarget); ok {
+				lanes = append(lanes, lane)
 			}
-			pending = append(pending, target)
 		}
-
-		candidates = append(candidates, candidate{node: node, date: date, kind: laneDeleted, refs: refs, anomalies: anomalies, pending: pending})
 	}
 
 	if tl.main != nil && tl.develop != nil {
@@ -373,55 +237,160 @@ func buildTimeline(repo git.Repository, classifier gitflow.Classifier, nodes []g
 				Type:   gitflow.TypeOther,
 				Parent: tl.develop.node.Name,
 			}
-			candidates = append(candidates, candidate{node: node, date: ev.date, kind: laneSync, refs: []mergeRef{ev}})
-		}
-	}
-
-	sort.Slice(candidates, func(i, j int) bool { return candidates[i].date < candidates[j].date })
-
-	for i, c := range candidates {
-		lane := timelineLane{node: c.node, col: i, kind: c.kind}
-		switch c.kind {
-		case laneDeleted, laneSync:
-			lane.merged = c.refs
-			lane.anomalies = c.anomalies
-			lane.pending = c.pending
-			// Une cible atteinte sans commit de fusion identifié (cf.
-			// IsAncestor) n'a pas de hash : prendre la première fusion
-			// réellement identifiée.
-			hash := ""
-			for _, mr := range append(append([]mergeRef{}, c.refs...), c.anomalies...) {
-				if mr.hash != "" {
-					hash = mr.hash
-					break
-				}
-			}
-			if hash != "" {
-				if commits, err := repo.MergeCommits(hash); err == nil {
-					lane.commits = commits
-				}
-			}
-		default:
-			lane.branch = byName[c.node.Name]
-			lane.wrongParent = c.wrongParent
-			for _, target := range c.node.MergeTargets {
-				if ev, ok := mergesByTarget.latest(target, c.node.Name); ok {
-					lane.merged = append(lane.merged, ev)
-				} else if merged, err := repo.IsAncestor(c.node.Name, target); err == nil && merged {
-					lane.merged = append(lane.merged, mergeRef{target: target})
-				} else {
-					lane.pending = append(lane.pending, target)
-				}
-			}
-			lane.anomalies = mergesByTarget.unexpected(c.node)
-			if commits, err := repo.CommitsNotIn(c.node.Name, c.node.Parent); err == nil {
+			lane := timelineLane{node: node, kind: laneSync, merged: []mergeRef{ev}, date: ev.date}
+			if commits, err := repo.MergeCommits(ev.hash); err == nil {
 				lane.commits = commits
 			}
+			lanes = append(lanes, lane)
 		}
-		tl.lanes = append(tl.lanes, lane)
 	}
 
+	sort.Slice(lanes, func(i, j int) bool {
+		if lanes[i].date != lanes[j].date {
+			return lanes[i].date < lanes[j].date
+		}
+		return lanes[i].node.Name < lanes[j].node.Name
+	})
+	for i := range lanes {
+		lanes[i].col = i
+	}
+	tl.lanes = lanes
 	return tl
+}
+
+// directCommits renvoie les commits arrivés directement sur ref, hors
+// fusion. Les intégrations de pull request en squash, qui n'ont qu'un parent
+// mais sont bien passées par une revue, n'en font pas partie.
+func directCommits(repo git.Repository, ref string) []git.Commit {
+	commits, err := repo.DirectCommits(ref)
+	if err != nil {
+		return nil
+	}
+	out := commits[:0]
+	for _, c := range commits {
+		if !gitflow.IsSquashMerge(c.Subject) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// laneDate renvoie la position d'une ligne sur l'axe du temps : la date de
+// sa première intégration connue (fusion vers une cible valide ou non),
+// sinon fallback — le point de divergence d'une branche pas encore
+// fusionnée. Toutes les dates sont au même format (ISO, fuseau local) et se
+// comparent donc comme des chaînes.
+func laneDate(merged, anomalies []mergeRef, fallback string) string {
+	date := ""
+	for _, refs := range [][]mergeRef{merged, anomalies} {
+		for _, mr := range refs {
+			if mr.date != "" && (date == "" || mr.date < date) {
+				date = mr.date
+			}
+		}
+	}
+	if date == "" {
+		return fallback
+	}
+	return date
+}
+
+// liveLane construit la ligne d'une branche éphémère encore présente
+// localement : fusions vers chacune de ses cibles (identifiées par leur
+// commit de fusion, ou à défaut par ascendance), cibles en attente,
+// fusions hors flow et point de divergence.
+func liveLane(repo git.Repository, classifier gitflow.Classifier, n gitflow.Node, branch git.Branch, commits []git.Commit, merges mergeIndex, sp spines) timelineLane {
+	lane := timelineLane{node: n, branch: branch, kind: laneLive, commits: commits}
+	for _, target := range n.MergeTargets {
+		if ev, ok := merges.latest(target, n.Name); ok {
+			lane.merged = append(lane.merged, ev)
+			continue
+		}
+		// Une branche sans commit propre (tout juste créée) est trivialement
+		// contenue dans sa parente : ce n'est pas pour autant une fusion.
+		if len(commits) > 0 {
+			if merged, err := repo.IsAncestor(n.Name, target); err == nil && merged {
+				lane.merged = append(lane.merged, mergeRef{target: target})
+				continue
+			}
+		}
+		lane.pending = append(lane.pending, target)
+	}
+	lane.anomalies = merges.unexpected(n)
+
+	fork, wrongParent := divergence(repo, n, classifier, sp)
+	lane.wrongParent = wrongParent
+	fallback := branch.CommitDate
+	if fork != "" {
+		if d, err := repo.CommitDate(fork); err == nil {
+			fallback = d
+		}
+	}
+	lane.date = laneDate(lane.merged, lane.anomalies, fallback)
+	return lane
+}
+
+// deletedLane reconstitue, depuis les messages de fusion, la ligne d'une
+// branche éphémère supprimée localement. ok vaut false si aucune fusion de
+// la branche n'a été trouvée.
+func deletedLane(repo git.Repository, node gitflow.Node, merges mergeIndex) (timelineLane, bool) {
+	// On ne retient comme fusion "normale" que les cibles réellement
+	// valides pour ce type de branche (ex. develop pour une feature).
+	var refs []mergeRef
+	for _, target := range node.MergeTargets {
+		if ev, ok := merges.latest(target, node.Name); ok {
+			refs = append(refs, ev)
+		}
+	}
+
+	// Une fusion trouvée dans une cible non valide (ex. main pour une
+	// feature) est soit un écho transitif (même commit que l'une des fusions
+	// valides — main a ensuite intégré develop), soit une vraie anomalie :
+	// une fusion directe hors du flow attendu.
+	anomalies := merges.unexpected(node)
+
+	if len(refs) == 0 && len(anomalies) == 0 {
+		return timelineLane{}, false
+	}
+	sort.Slice(refs, func(i, j int) bool { return refs[i].date < refs[j].date })
+
+	// Première fusion réellement identifiée : ses commits sont ceux de la
+	// branche, et son second parent est la pointe de la branche supprimée.
+	known := refs
+	if len(known) == 0 {
+		known = anomalies
+	}
+	hash := known[0].hash
+
+	// Une cible valide sans fusion identifiée peut malgré tout contenir le
+	// travail de la branche, arrivé par un autre chemin (hotfix fusionné
+	// dans la release en cours, qui a ensuite rejoint develop) : il suffit
+	// de vérifier que la cible contient la pointe de la branche. Sinon la
+	// cible n'a jamais été atteinte.
+	var pending []string
+	for _, target := range node.MergeTargets {
+		if _, ok := merges.latest(target, node.Name); ok {
+			continue
+		}
+		if merged, err := repo.IsAncestor(hash+"^2", target); err == nil && merged {
+			refs = append(refs, mergeRef{target: target})
+			continue
+		}
+		pending = append(pending, target)
+	}
+
+	lane := timelineLane{
+		node:      node,
+		kind:      laneDeleted,
+		merged:    refs,
+		anomalies: anomalies,
+		pending:   pending,
+		date:      laneDate(refs, anomalies, ""),
+	}
+	if commits, err := repo.MergeCommits(hash); err == nil {
+		lane.commits = commits
+	}
+	return lane, true
 }
 
 // laneBelongsToMain indique si une ligne doit être regroupée sous la ligne
@@ -492,28 +461,69 @@ func filterAlerts(tl timeline) timeline {
 	return out
 }
 
+// compactColumns renumérote les colonnes des lignes visibles de 0 à n-1,
+// dans leur ordre chronologique : une fois l'historique filtré (alertes,
+// direct), les colonnes des lignes masquées laisseraient sinon des trous et
+// étireraient le diagramme bien au-delà de ce qui est affiché.
+func compactColumns(lanes []timelineLane) []timelineLane {
+	out := make([]timelineLane, len(lanes))
+	copy(out, lanes)
+	sort.SliceStable(out, func(i, j int) bool { return out[i].col < out[j].col })
+	for i := range out {
+		out[i].col = i
+	}
+	return out
+}
+
+// laneX renvoie la position horizontale (en caractères) du repère d'une
+// ligne, identique sur la ligne permanente ("┬") et sur la ligne de la
+// branche ("└─▶").
+func laneX(l timelineLane) int {
+	return laneLabelWidth + l.col*cellWidth
+}
+
+// rails dessine les width premiers caractères d'une ligne du diagramme : un
+// trait vertical "│" sous le repère de chaque ligne encore à venir (open),
+// qui relie ce repère sur la ligne permanente à la ligne de sa branche, et
+// des espaces ailleurs.
+func rails(width int, open []timelineLane) string {
+	at := make(map[int]timelineLane, len(open))
+	for _, l := range open {
+		at[laneX(l)] = l
+	}
+	var b strings.Builder
+	for x := 0; x < width; x++ {
+		if l, ok := at[x]; ok {
+			b.WriteString(lipgloss.NewStyle().Foreground(laneColor(l)).Faint(l.kind == laneDeleted).Render("│"))
+		} else {
+			b.WriteByte(' ')
+		}
+	}
+	return b.String()
+}
+
+// renderTimeline dessine le diagramme : chaque ligne permanente, suivie des
+// lignes de branches qui s'y rattachent, de la plus récente (repère le plus
+// à droite) à la plus ancienne. Dans cet ordre, les traits verticaux des
+// lignes restant à dessiner passent toujours à gauche du texte de la ligne
+// courante, sans jamais le croiser.
 func renderTimeline(tl timeline, emptyMsg string) string {
 	if tl.main == nil && tl.develop == nil {
 		return "Aucune branche main/develop trouvée."
 	}
 
-	maxCol := -1
-	for _, l := range tl.lanes {
-		if l.col > maxCol {
-			maxCol = l.col
-		}
-	}
-	spineLen := (maxCol+2)*cellWidth + 2
+	tl.lanes = compactColumns(tl.lanes)
+	spineLen := (len(tl.lanes)+1)*cellWidth + 2
 	if spineLen < 16 {
 		spineLen = 16
 	}
 
 	var mainLanes, developLanes []timelineLane
-	for _, l := range tl.lanes {
-		if laneBelongsToMain(l) {
-			mainLanes = append(mainLanes, l)
+	for i := len(tl.lanes) - 1; i >= 0; i-- {
+		if laneBelongsToMain(tl.lanes[i]) {
+			mainLanes = append(mainLanes, tl.lanes[i])
 		} else {
-			developLanes = append(developLanes, l)
+			developLanes = append(developLanes, tl.lanes[i])
 		}
 	}
 
@@ -522,16 +532,18 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 		if spine == nil {
 			return
 		}
-		label := spine.node.Name
-		b.WriteString(renderSpine(label, color, *spine, spineLen, tl.lanes))
+		b.WriteString(renderSpine(color, *spine, spineLen, tl.lanes, group))
 		b.WriteString("\n")
-		if block := renderDirectCommits(label, direct); block != "" {
-			b.WriteString(block)
+		if len(group) > 0 {
+			b.WriteString(rails(laneX(group[0])+1, group))
 			b.WriteString("\n")
 		}
-		b.WriteString("\n")
-		for _, l := range group {
-			b.WriteString(renderLane(l))
+		for i, l := range group {
+			b.WriteString(renderLane(l, group[i+1:]))
+			b.WriteString("\n")
+		}
+		if block := renderDirectCommits(spine.node.Name, direct); block != "" {
+			b.WriteString(block)
 			b.WriteString("\n")
 		}
 		b.WriteString("\n")
@@ -548,9 +560,10 @@ func renderTimeline(tl timeline, emptyMsg string) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderDirectCommits affiche, juste sous une ligne permanente, les commits
-// qui y ont été committés directement plutôt que d'y arriver par une fusion
-// — un contournement complet du workflow GitFlow.
+// renderDirectCommits affiche, à la suite des lignes de branches d'une ligne
+// permanente (dont les traits verticaux occupent l'espace juste en
+// dessous), les commits qui y ont été committés directement plutôt que d'y
+// arriver par une fusion — un contournement complet du workflow GitFlow.
 func renderDirectCommits(spineLabel string, commits []git.Commit) string {
 	if len(commits) == 0 {
 		return ""
@@ -581,9 +594,15 @@ func renderDirectCommits(spineLabel string, commits []git.Commit) string {
 // continu marqué d'un repère "┬" à chaque colonne où une ligne part d'ici,
 // y a été fusionnée, ou y a été fusionnée en dehors du flow attendu (repère
 // alors en couleur d'alerte) — de quoi voir en un coup d'œil tout ce qui a
-// atterri dans main, conforme ou non. Les repères des branches supprimées
-// sont atténués.
-func renderSpine(label string, spineColor lipgloss.Color, spine timelineLane, length int, lanes []timelineLane) string {
+// atterri dans main, conforme ou non. Les lignes de group, dessinées sous
+// cette ligne permanente, y ont toujours un repère, point de départ de leur
+// trait vertical. Les repères des branches supprimées sont atténués.
+func renderSpine(spineColor lipgloss.Color, spine timelineLane, length int, lanes, group []timelineLane) string {
+	inGroup := make(map[int]bool, len(group))
+	for _, l := range group {
+		inGroup[l.col] = true
+	}
+
 	cells := make([]rune, length)
 	for i := range cells {
 		cells[i] = '─'
@@ -591,7 +610,7 @@ func renderSpine(label string, spineColor lipgloss.Color, spine timelineLane, le
 	marks := make(map[int]lipgloss.Color, len(lanes))
 	faint := make(map[int]bool, len(lanes))
 	for _, l := range lanes {
-		concerned := l.node.Parent == spine.node.Name
+		concerned := inGroup[l.col] || l.node.Parent == spine.node.Name
 		anomaly := false
 		if !concerned {
 			for _, mr := range l.merged {
@@ -647,20 +666,22 @@ func renderSpine(label string, spineColor lipgloss.Color, spine timelineLane, le
 	if spine.branch.IsHead {
 		marker = "●"
 	}
-	head := lipgloss.NewStyle().Foreground(spineColor).Bold(true).Render(fmt.Sprintf("%s %-9s", marker, label))
+	// Nom tronqué pour ne pas décaler l'axe du temps (cf. laneLabelWidth).
+	head := lipgloss.NewStyle().Foreground(spineColor).Bold(true).Render(fmt.Sprintf("%s %-9.9s", marker, spine.node.Name))
 	return head + body.String()
 }
 
 // renderLane dessine la ligne d'une branche ou d'une synchronisation : un
-// repère aligné sous celui de sa ligne parente, son nom, ses cibles de
+// repère aligné sous celui de sa ligne permanente (les traits verticaux des
+// lignes encore à dessiner, open, passant à sa gauche), son nom, ses cibles de
 // fusion, son statut, une éventuelle fusion hors GitFlow, et la liste
 // (tronquée) des commits apportés. Les branches supprimées sont affichées
 // en atténué avec la mention "supprimée" ; toute fusion en dehors du flow
 // GitFlow attendu (develop → main direct, feature → main, fusion
 // incomplète...) est signalée en couleur d'alerte.
-func renderLane(l timelineLane) string {
+func renderLane(l timelineLane, open []timelineLane) string {
 	color := laneColor(l)
-	indent := strings.Repeat(" ", laneLabelWidth)
+	indent := rails(laneX(l), open)
 	subIndent := indent + "    "
 	faint := l.kind == laneDeleted
 	warnStyle := lipgloss.NewStyle().Foreground(colorWarning)

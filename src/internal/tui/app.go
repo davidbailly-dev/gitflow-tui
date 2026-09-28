@@ -189,18 +189,33 @@ func loadData(repo git.Repository) tea.Cmd {
 		classifier := gitflow.NewClassifier(names)
 		nodes := classifier.Classify(names)
 
+		var permanent []string
+		for _, name := range []string{classifier.Main, classifier.Develop} {
+			if _, ok := byName[name]; ok {
+				permanent = append(permanent, name)
+			}
+		}
+		sp := loadSpines(repo, permanent...)
+
+		// main et develop listent tout leur historique direct ; les autres
+		// branches, leurs seuls commits propres (partagés avec le graphe).
+		commitsByName := make(map[string][]git.Commit, len(nodes))
 		toItem := func(n gitflow.Node) item {
 			it := item{node: n, branch: byName[n.Name]}
 			if n.Parent != "" {
 				if ahead, behind, err := repo.AheadBehind(n.Parent, n.Name); err == nil {
 					it.ahead, it.behind = ahead, behind
 				}
-				if commits, err := repo.CommitsNotIn(n.Name, n.Parent); err == nil {
+			}
+			switch n.Type {
+			case gitflow.TypeMain, gitflow.TypeDevelop:
+				if commits, err := repo.FirstParentCommits(n.Name); err == nil {
 					it.commits = commits
 				}
-			} else if commits, err := repo.FirstParentCommits(n.Name); err == nil {
-				it.commits = commits
+			default:
+				it.commits = ownCommits(repo, n, sp)
 			}
+			commitsByName[n.Name] = it.commits
 			return it
 		}
 
@@ -250,7 +265,7 @@ func loadData(repo git.Repository) tea.Cmd {
 			{title: "autre", items: build(others)},
 		}
 
-		tl := buildTimeline(repo, classifier, nodes, byName)
+		tl := buildTimeline(repo, classifier, nodes, byName, sp, commitsByName)
 
 		return dataLoadedMsg{columns: cols, timeline: tl, fingerprint: fingerprint}
 	}
@@ -626,10 +641,21 @@ func (m *Model) ensureBranchSelection() {
 // restoreBranchSelection retrouve, après un rechargement des données, la
 // ligne correspondant à la branche qui était sélectionnée avant coup — par
 // son nom, pas son index, puisqu'une branche ajoutée ou supprimée décale
-// les positions sans changer les noms des autres. Si cette branche n'existe
-// plus (supprimée entre-temps), retombe sur la première branche visible.
+// les positions sans changer les noms des autres. Au premier chargement,
+// aucune branche n'est encore retenue : la sélection part de la branche
+// courante (HEAD). Si la branche retenue n'existe plus (supprimée
+// entre-temps), retombe sur la première branche visible.
 func (m *Model) restoreBranchSelection() {
 	rows := m.flatBranches()
+	if m.selectedBranchName == "" {
+		for i, row := range rows {
+			if selectableRow(rows, i) && row.it.branch.IsHead {
+				m.branchIdx = i
+				m.syncSelectedBranchName()
+				return
+			}
+		}
+	}
 	if m.selectedBranchName != "" {
 		for i, row := range rows {
 			if selectableRow(rows, i) && row.it.node.Name == m.selectedBranchName {

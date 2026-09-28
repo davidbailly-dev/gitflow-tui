@@ -42,3 +42,20 @@ func TestMergeIsPull(t *testing.T) {
 		t.Error("une fusion de feature ne devrait pas être prise pour un git pull")
 	}
 }
+
+func TestIsSquashMerge(t *testing.T) {
+	cases := []struct {
+		subject string
+		want    bool
+	}{
+		{"feat: ajoute les notifications (#12)", true},
+		{"Merged in feature/x (pull request #12)", true},
+		{"fix: corrige l'issue #12", false},
+		{"docs: met à jour le README", false},
+	}
+	for _, c := range cases {
+		if got := IsSquashMerge(c.subject); got != c.want {
+			t.Errorf("IsSquashMerge(%q) = %v, attendu %v", c.subject, got, c.want)
+		}
+	}
+}

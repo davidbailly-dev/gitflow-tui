@@ -6,12 +6,11 @@ import "strings"
 type Branch struct {
 	Name       string
 	Head       string // hash court du dernier commit
-	CommitDate string
-	Upstream   string // branche distante suivie, vide si aucune
+	CommitDate string // date du dernier commit (committer, fuseau local)
 	IsHead     bool
 }
 
-const branchFormat = "%(refname:short)|%(objectname:short)|%(committerdate:iso8601)|%(upstream:short)"
+const branchFormat = "%(refname:short)|%(objectname:short)|%(committerdate:iso-local)"
 
 func (r *execRepository) Branches() ([]Branch, error) {
 	out, err := r.run("for-each-ref", "--format="+branchFormat, "refs/heads")
@@ -25,15 +24,14 @@ func (r *execRepository) Branches() ([]Branch, error) {
 		if line == "" {
 			continue
 		}
-		parts := strings.SplitN(line, "|", 4)
-		if len(parts) != 4 {
+		parts := strings.SplitN(line, "|", 3)
+		if len(parts) != 3 {
 			continue
 		}
 		branches = append(branches, Branch{
 			Name:       parts[0],
 			Head:       parts[1],
 			CommitDate: parts[2],
-			Upstream:   parts[3],
 			IsHead:     parts[0] == current,
 		})
 	}

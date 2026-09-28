@@ -25,6 +25,9 @@ var (
 	pullRequestRe = regexp.MustCompile(`^Merge pull request #\d+ from (\S+)`)
 	// Bitbucket : Merged in feature/x (pull request #12)
 	bitbucketRe = regexp.MustCompile(`^Merged in (\S+)`)
+	// Suffixe ajouté par GitHub au sujet d'un merge de pull request en
+	// squash : "feat: ajoute X (#12)".
+	pullRequestSuffixRe = regexp.MustCompile(`\(#\d+\)\s*$`)
 )
 
 // ParseMerge extrait la branche source (et la cible si elle est indiquée)
@@ -46,6 +49,20 @@ func ParseMerge(subject string) (m Merge, ok bool) {
 		return Merge{Source: sm[1]}, true
 	}
 	return Merge{}, false
+}
+
+// IsSquashMerge signale un commit ordinaire (un seul parent) qui résulte en
+// fait de l'intégration d'une pull request en squash : sujet portant le
+// numéro de la pull request (GitHub) ou message de fusion conservé tel quel
+// (Bitbucket). Un tel commit n'est pas un commit direct hors GitFlow. Une
+// intégration en "rebase and merge" ne laisse en revanche aucune trace
+// reconnaissable.
+func IsSquashMerge(subject string) bool {
+	if pullRequestSuffixRe.MatchString(subject) {
+		return true
+	}
+	_, ok := ParseMerge(subject)
+	return ok
 }
 
 // IsPull signale une fusion d'une branche distante dans sa propre copie

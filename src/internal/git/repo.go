@@ -26,14 +26,14 @@ type Repository interface {
 	CurrentBranch() (string, error)
 	Branches() ([]Branch, error)
 	AheadBehind(base, branch string) (ahead, behind int, err error)
-	CommitsNotIn(branch, base string) ([]Commit, error)
+	CommitsNotIn(branch string, bases ...string) ([]Commit, error)
+	FirstParentCommitsSince(branch, fork string) ([]Commit, error)
 	MergeCommits(mergeHash string) ([]Commit, error)
 	MergeSubjects(ref string) (string, error)
 	DirectCommits(ref string) ([]Commit, error)
 	FirstParentHashes(ref string) ([]string, error)
 	FirstParentCommits(ref string) ([]Commit, error)
 	Show(hash string) (string, error)
-	MergeBase(a, b string) (string, error)
 	CommitDate(ref string) (string, error)
 	IsAncestor(ancestor, descendant string) (bool, error)
 
@@ -103,12 +103,11 @@ func (r *execRepository) CurrentBranch() (string, error) {
 	return r.run("branch", "--show-current")
 }
 
-func (r *execRepository) MergeBase(a, b string) (string, error) {
-	return r.run("merge-base", a, b)
-}
-
+// CommitDate renvoie la date de commit de ref, dans le fuseau local : toutes
+// les dates servant à ordonner les événements (branches, fusions) partagent
+// ce format, ce qui permet de les comparer comme de simples chaînes.
 func (r *execRepository) CommitDate(ref string) (string, error) {
-	return r.run("log", "-1", "--date=iso8601", "--pretty=format:%ad", ref)
+	return r.run("log", "-1", "--date=iso-local", "--pretty=format:%cd", ref)
 }
 
 // IsAncestor renvoie true si ancestor est un ancêtre de descendant (ou lui

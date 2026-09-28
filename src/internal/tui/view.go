@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 
@@ -87,35 +88,54 @@ func (m Model) renderFooter() string {
 	if m.filtering {
 		return styleFooter.Width(maxInt(m.width, 0)).Render("Filtrer : " + m.filter + "█  (entrée: valider, échap: annuler)")
 	}
-	help := "tab: vue  ↑↓←→/hjkl: naviguer  /: filtrer  r: rafraîchir  ?: aide  q: quitter"
+	bindings := []key.Binding{keys.Tab, keys.Navigate, keys.Filter}
 	if m.view == viewGraph {
-		help = "tab: vue  m: historique/direct  ↑↓: défiler  r: rafraîchir  ?: aide  q: quitter"
+		bindings = []key.Binding{keys.Tab, keys.Mode}
 		if m.graphMode == graphHistory {
-			help = "tab: vue  m: historique/direct  a: alertes/complet  ↑↓: défiler  r: rafraîchir  ?: aide  q: quitter"
+			bindings = append(bindings, keys.Alerts)
 		}
+		bindings = append(bindings, keys.Scroll)
 	}
+	bindings = append(bindings, keys.Refresh, keys.Help, keys.Quit)
+
+	help := shortHelp(bindings...)
 	if m.filter != "" {
 		help = "filtre actif: " + m.filter + "  |  " + help
 	}
 	return styleFooter.Width(maxInt(m.width, 0)).Render(help)
 }
 
+// shortHelp résume des raccourcis sur une ligne ("tab: changer de vue  …").
+func shortHelp(bindings ...key.Binding) string {
+	parts := make([]string, 0, len(bindings))
+	for _, b := range bindings {
+		h := b.Help()
+		parts = append(parts, h.Key+": "+h.Desc)
+	}
+	return strings.Join(parts, "  ")
+}
+
+// helpSection liste des raccourcis sous un titre, un par ligne.
+func helpSection(title string, bindings ...key.Binding) []string {
+	lines := []string{styleColumnTitle.Render(title)}
+	for _, b := range bindings {
+		h := b.Help()
+		lines = append(lines, fmt.Sprintf("  %-12s %s", h.Key, h.Desc))
+	}
+	return append(lines, "")
+}
+
 func (m Model) renderHelp() string {
-	lines := []string{
-		"Aide — gitflow-tui",
-		"",
-		"tab            changer de vue (colonnes / graphe)",
-		"m              basculer historique / direct (vue graphe)",
-		"a              basculer alertes seulement / historique complet (vue historique)",
-		"←/→, h/l       changer de panneau (branches / commits / contenu)",
-		"↑/↓, j/k       se déplacer dans le panneau actif (ou défiler le contenu)",
-		"/              filtrer les branches par nom (vue colonnes)",
-		"r              rafraîchir les données",
-		"?              afficher/masquer cette aide",
-		"q, ctrl+c      quitter",
+	lines := []string{"Aide — gitflow-tui", ""}
+	lines = append(lines, helpSection("Général", keys.Tab, keys.Refresh, keys.Help, keys.Quit)...)
+	lines = append(lines, helpSection("Vue colonnes", keys.Up, keys.Down, keys.Left, keys.Right, keys.Filter)...)
+	lines = append(lines, helpSection("Vue graphe", keys.Mode, keys.Alerts, keys.Scroll)...)
+	lines = append(lines,
+		styleFaint.Render("Le dépôt est surveillé : l'affichage se met à jour de lui-même après un"),
+		styleFaint.Render("commit, une fusion, un changement ou une suppression de branche."),
 		"",
 		"Appuie sur ? pour revenir.",
-	}
+	)
 	return lipgloss.NewStyle().Padding(1, 2).Render(strings.Join(lines, "\n"))
 }
 
